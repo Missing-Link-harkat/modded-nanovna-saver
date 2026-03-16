@@ -1,0 +1,5 @@
+[console_scripts]
+NanoVNASaver = NanoVNASaver.__main__:main
+
+[gui_scripts]
+NanoVNASaver-gui = NanoVNASaver.__main__:main
