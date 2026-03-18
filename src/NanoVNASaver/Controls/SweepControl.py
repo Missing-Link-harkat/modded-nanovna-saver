@@ -127,6 +127,15 @@ class SweepControl(Control):
         btn_layout_widget.setLayout(btn_layout)
         self.layout.addRow(btn_layout_widget)
 
+        # ---- Custom Sweep Button ----
+        self.btn_custom_sweep = QtWidgets.QPushButton("Segmented Sweep ...")
+        self.btn_custom_sweep.setFixedHeight(20)
+        self.btn_custom_sweep.clicked.connect(
+            lambda: self.app.display_window("custom_sweep")
+        )
+
+        self.layout.addRow(self.btn_custom_sweep)
+
         self.inputs["Start"].textEdited.emit(self.inputs["Start"].text())
         self.inputs["Start"].textChanged.emit(self.inputs["Start"].text())
 

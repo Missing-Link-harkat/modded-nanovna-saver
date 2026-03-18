@@ -22,7 +22,7 @@ import threading
 from time import localtime, strftime
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QWidget
 
 from .About import VERSION
@@ -54,6 +54,8 @@ from .Charts.Chart import Chart
 from .Controls.MarkerControl import MarkerControl
 from .Controls.SerialControl import SerialControl
 from .Controls.SweepControl import SweepControl
+## import custom sweep window
+from .Windows.CustomSweepWindow import CustomSweepWindow
 from .Defaults import APP_SETTINGS, AppSettings, get_app_config
 from .Formatting import format_frequency, format_gain, format_vswr
 from .Hardware.Hardware import Interface
@@ -77,6 +79,8 @@ from .Windows import (
 )
 from .Windows.ui import get_window_icon
 
+# from .SweepLogger import start_log, log_points, stop_log
+
 logger = logging.getLogger(__name__)
 
 WORKING_KILL_TIME_MS = 10 * 1000
@@ -87,6 +91,9 @@ class Communicate(QObject):
 
 
 class NanoVNASaver(QWidget):
+
+    sweep_frame_finished = Signal()
+    
     version = VERSION
     scale_factor = 1.0
 
@@ -269,6 +276,7 @@ class NanoVNASaver(QWidget):
             "sweep_settings": SweepSettingsWindow(self),
             "setup": DisplaySettingsWindow(self),
             "tdr": TDRWindow(self),
+            "custom_sweep": CustomSweepWindow(self),
         }
 
         ###############################################################
@@ -483,6 +491,7 @@ class NanoVNASaver(QWidget):
         self.tdr_result_label.setText("")
 
         logger.debug("Starting worker thread")
+
         self.worker.start()
         # TODO: Rewrite to make worker a qrunnable with worker signals
         # https://www.pythonguis.com/tutorials/multithreading-pyqt6-applications-qthreadpool/
@@ -584,8 +593,11 @@ class NanoVNASaver(QWidget):
     def sweepFinished(self):
         self._sweep_control(start=False)
 
+        # notify segmented sweep window that one frame finished
+        self.sweep_frame_finished.emit()
+
         for marker in self.markers:
-            marker.frequencyInput.textEdited.emit(marker.frequencyInput.text())
+            marker.frequencyInput.textEdited.emit(marker.frequencyInput.text())       
 
     def setReference(self, s11=None, s21=None, source=None):
         if not s11:
