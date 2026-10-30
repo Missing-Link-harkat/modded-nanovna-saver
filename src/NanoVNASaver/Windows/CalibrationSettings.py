@@ -705,10 +705,11 @@ class CalibrationWindow(QtWidgets.QWidget):
             return
         self.app.sweep_control.update_text()
 
-    def loadCalibration(self):
-        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
-            filter="Calibration Files (*.cal);;All files (*.*)"
-        )
+    def loadCalibration(self, filename: str = ""):
+        if not filename:
+            filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+                filter="Calibration Files (*.cal);;All files (*.*)"
+            )
         if filename:
             self.app.calibration.load(filename)
         if not self.app.calibration.isValid1Port():
@@ -730,19 +731,24 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.app.settings.setValue("CalibrationFile", filename)
         self.app.sweep_control.update_text()
 
-    def saveCalibration(self):
+    def saveCalibration(self, filename: str = ""):
         if not self.app.calibration.isCalculated:
             logger.debug("Attempted to save an uncalculated calibration.")
             self.app.showError("Cannot save an unapplied calibration state.")
             return
-        filedialog = QtWidgets.QFileDialog(self)
-        filedialog.setDefaultSuffix("cal")
-        filedialog.setNameFilter("Calibration Files (*.cal);;All files (*.*)")
-        filedialog.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptSave)
-        if filedialog.exec():
-            filename = filedialog.selectedFiles()[0]
-        else:
-            return
+        if not filename:
+            filedialog = QtWidgets.QFileDialog(self)
+            filedialog.setDefaultSuffix("cal")
+            filedialog.setNameFilter(
+                "Calibration Files (*.cal);;All files (*.*)"
+            )
+            filedialog.setAcceptMode(
+                QtWidgets.QFileDialog.AcceptMode.AcceptSave
+            )
+            if filedialog.exec():
+                filename = filedialog.selectedFiles()[0]
+            else:
+                return
         if not filename:
             logger.debug("No file name selected.")
             return
