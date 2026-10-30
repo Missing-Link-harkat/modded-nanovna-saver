@@ -62,3 +62,9 @@ src/NanoVNASaver/Windows/ui/about.py
 
 *.spec
 *_rc.py
+
+# Missing-Link
+__pycache__/
+venv/
+.venv/
+segmented_sweeps/

@@ -2,8 +2,10 @@
 name: Stale
 
 on:
-  schedule:
-    - cron: "0 8 * * *"
+  # Missing-Link: ajastus pois, ettei ylävirran stale-sääntö sulje
+  # tämän repon issueita/PR:iä. Ajettavissa käsin.
+  # schedule:
+  #   - cron: "0 8 * * *"
   workflow_dispatch:
 
 jobs:
