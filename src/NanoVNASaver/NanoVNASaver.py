@@ -62,6 +62,7 @@ from .Hardware.Hardware import Interface
 from .Hardware.VNA import VNA
 from .Marker.Delta import DeltaMarker
 from .Marker.Widget import Marker
+from .MCP import MCPOptions, MCPSupport
 from .RFTools import corr_att_data
 from .Settings.Bands import BandsModel
 from .Settings.Sweep import Sweep
@@ -97,7 +98,7 @@ class NanoVNASaver(QWidget):
     version = VERSION
     scale_factor = 1.0
 
-    def __init__(self) -> None:
+    def __init__(self, mcp_options: MCPOptions | None = None) -> None:
         super().__init__()
         self.communicate = Communicate()
         self.s21att = 0.0
@@ -425,6 +426,13 @@ class NanoVNASaver(QWidget):
         left_column.addWidget(self.serial_control)
 
         ###############################################################
+        #  AI (MCP)
+        ###############################################################
+
+        self.mcp = MCPSupport(self, mcp_options or MCPOptions())
+        left_column.addWidget(self.mcp.create_panel())
+
+        ###############################################################
         #  Calibration
         ###############################################################
 
@@ -683,6 +691,8 @@ class NanoVNASaver(QWidget):
         return new_chart
 
     def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
+        if self.mcp.service is not None:
+            self.mcp.service.stop_http()
         self.worker.quit()
         self.worker.wait(WORKING_KILL_TIME_MS)
         for marker in self.markers:
