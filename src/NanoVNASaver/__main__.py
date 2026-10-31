@@ -27,12 +27,16 @@ resulting data.
 
 import argparse
 import logging
+import os
 import sys
+from pathlib import Path
 
 from PySide6 import QtWidgets
 
 from NanoVNASaver import NanoVNASaver
 from NanoVNASaver.About import INFO, VERSION
+from NanoVNASaver.Hardware import VirtualVNA
+from NanoVNASaver.MCP import MCPOptions
 from NanoVNASaver.Touchstone import Touchstone
 from NanoVNASaver.utils import get_runtime_information
 
@@ -65,14 +69,51 @@ def main():
         help="Touchstone file to load as reference for off device usage",
     )
     parser.add_argument(
+        "--mcp",
+        choices=("off", "http", "stdio"),
+        default="off",
+        help="Start the MCP server for LLM clients (see docs/MCP.md)",
+    )
+    parser.add_argument(
+        "--mcp-port", type=int, default=8765, help="MCP HTTP port"
+    )
+    parser.add_argument(
+        "--mcp-allow",
+        action="store_true",
+        help="Allow AI control at start (otherwise the user ticks it)",
+    )
+    parser.add_argument(
+        "--mcp-dir",
+        type=Path,
+        help="Work folder for files read/written by MCP",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="No window (with --mcp stdio); AI control is allowed",
+    )
+    parser.add_argument(
+        "--virtual",
+        nargs="?",
+        const="",
+        metavar="TOUCHSTONE",
+        help="Add a simulated VNA (optionally replaying a .s1p/.s2p file)",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"NanoVNASaver {VERSION}"
     )
     args = parser.parse_args()
 
+    if args.headless:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if args.virtual is not None:
+        VirtualVNA.enable(args.virtual or None)
+
     console_log_level = logging.WARNING
     file_log_level = logging.DEBUG
 
-    print(INFO)
+    # with --mcp stdio, stdout carries the MCP protocol: print elsewhere
+    print(INFO, file=sys.stderr if args.mcp == "stdio" else sys.stdout)
 
     if args.debug:
         console_log_level = logging.DEBUG
@@ -102,8 +143,17 @@ def main():
     logger.info("Startup...")
 
     app = QtWidgets.QApplication(sys.argv)
-    window = NanoVNASaver()
-    window.show()
+    window = NanoVNASaver(
+        MCPOptions(
+            mode=args.mcp,
+            port=args.mcp_port,
+            allow=args.mcp_allow,
+            workspace=args.mcp_dir,
+            headless=args.headless,
+        )
+    )
+    if not args.headless:
+        window.show()
 
     if args.auto_connect:
         window.auto_connect()
@@ -117,6 +167,7 @@ def main():
         t.load()
         window.setReference(t.s11, t.s21, args.ref_file)
         window.dataUpdated()
+    window.mcp.start(on_exit=app.quit)
     try:
         app.exec()
     except BaseException as exc:

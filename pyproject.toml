@@ -32,6 +32,13 @@ dependencies=[
   'scipy~=1.14',
 ]
 
+[project.optional-dependencies]
+# MCP server for LLM clients (docs/MCP.md)
+mcp = [
+  'mcp>=1.12,<3',
+  'uvicorn>=0.30',
+]
+
 [dependency-groups]
 dev = [
   # Static Code Analysis tools

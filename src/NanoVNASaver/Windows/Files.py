@@ -108,6 +108,14 @@ class FilesWindow(QtWidgets.QWidget):
             logger.debug("No file name selected.")
             return
 
+        try:
+            self.export_touchstone(filename, nr_params)
+        except IOError as e:
+            logger.exception("Error during file export: %s", e)
+            return
+
+    def export_touchstone(self, filename: str, nr_params: int = 1) -> None:
+        """Write the current sweep; nr_params 1 = s1p, 4 = s2p."""
         ts = Touchstone(filename)
         ts.sdata[0] = self.app.data.s11
         if nr_params > 1:
@@ -115,30 +123,32 @@ class FilesWindow(QtWidgets.QWidget):
             for dp in self.app.data.s11:
                 ts.sdata[2].append(Datapoint(dp.freq, 0, 0))
                 ts.sdata[3].append(Datapoint(dp.freq, 0, 0))
-        try:
-            ts.save(nr_params)
-        except IOError as e:
-            logger.exception("Error during file export: %s", e)
-            return
+        ts.save(nr_params)
 
     def loadReferenceFile(self):
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             filter="Touchstone Files (*.s1p *.s2p);;All files (*.*)"
         )
         if filename != "":
-            self.app.resetReference()
-            t = Touchstone(filename)
-            t.load()
-            self.app.setReference(t.s11, t.s21, filename)
+            self.load_reference(filename)
+
+    def load_reference(self, filename: str) -> None:
+        self.app.resetReference()
+        t = Touchstone(filename)
+        t.load()
+        self.app.setReference(t.s11, t.s21, filename)
 
     def loadSweepFile(self):
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             filter="Touchstone Files (*.s1p *.s2p);;All files (*.*)"
         )
         if filename != "":
-            self.app.data.s11 = []
-            self.app.data.s21 = []
-            t = Touchstone(filename)
-            t.load()
-            self.app.saveData(t.s11, t.s21, filename)
-            self.app.dataUpdated()
+            self.load_sweep(filename)
+
+    def load_sweep(self, filename: str) -> None:
+        self.app.data.s11 = []
+        self.app.data.s21 = []
+        t = Touchstone(filename)
+        t.load()
+        self.app.saveData(t.s11, t.s21, filename)
+        self.app.dataUpdated()
