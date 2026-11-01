@@ -126,7 +126,7 @@ def test_panel_flow(window):
     assert not is_error(box["value"])
 
     # 4. tick the box: ACT works and shows in the status while running
-    QTest.mouseClick(panel.check_allow, QtCore.Qt.MouseButton.LeftButton)
+    panel.check_allow.click()
     pump(qapp, lambda: panel.control.allowed)
     _, box = call_in_thread(qapp, server, "device_connect", {"port": "virtual"})
     assert not is_error(box["value"]), box["value"].content[0].text
@@ -157,7 +157,7 @@ def test_panel_flow(window):
     shot(panel, "5_stop")
 
     # 6. Ctrl+Shift+S does the same from anywhere in the window
-    QTest.mouseClick(panel.check_allow, QtCore.Qt.MouseButton.LeftButton)
+    panel.check_allow.click()
     pump(qapp, lambda: panel.control.allowed)
     win.activateWindow()
     QTest.keyClick(win, QtCore.Qt.Key.Key_S,
@@ -167,7 +167,7 @@ def test_panel_flow(window):
     assert not panel.check_allow.isChecked()
 
     # 7. stopping the server also takes AI control away
-    QTest.mouseClick(panel.check_allow, QtCore.Qt.MouseButton.LeftButton)
+    panel.check_allow.click()
     pump(qapp, lambda: panel.control.allowed)
     QTest.mouseClick(panel.btn_server, QtCore.Qt.MouseButton.LeftButton)
     pump(qapp, lambda: not panel.service.url)

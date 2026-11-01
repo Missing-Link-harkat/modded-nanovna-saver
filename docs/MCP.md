@@ -65,6 +65,11 @@ python -m NanoVNASaver --virtual --mcp http --mcp-allow
 
 ## Turvallisuus
 
+| AI ohjaa | STOP painettu |
+|---|---|
+| ![AI ohjaa](kuvat/mcp-paneeli-ai-ohjaa.png) | ![STOP](kuvat/mcp-paneeli-stop.png) |
+
+
 | taso | mitä | ehto |
 |---|---|---|
 | **read** | tilan ja datan lukeminen, kaaviot, analyysit | aina, kun palvelin on käynnissä |
