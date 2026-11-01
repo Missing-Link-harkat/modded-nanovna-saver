@@ -157,9 +157,11 @@ def result_text(result) -> str:
 async def read_state(client, check: str) -> float | None:
     if check == "marker0_hz":
         res = await client.call_tool("marker_list", {})
-        markers = json.loads(res.content[0].text)
-        if markers and markers[0].get("freq_hz"):
-            return float(markers[0]["freq_hz"])
+        # list results come as one content item (JSON object) per element
+        for item in res.content:
+            marker = json.loads(item.text)
+            if marker.get("index") == 0 and marker.get("freq_hz"):
+                return float(marker["freq_hz"])
     return None
 
 

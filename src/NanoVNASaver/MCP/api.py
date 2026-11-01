@@ -776,6 +776,10 @@ class SaverAPI:
                 "freq_hz": getattr(m, "freq", None),
             }
             if 0 <= m.location < len(s11):
+                # The data point the marker sits on; Marker.freq can lag
+                # behind it (it reported the initial position after
+                # marker_set).
+                item["freq_hz"] = s11[m.location].freq
                 item["s11"] = _point(s11[m.location], "s11")
                 if m.location < len(s21):
                     item["s21"] = _point(s21[m.location], "s21")
