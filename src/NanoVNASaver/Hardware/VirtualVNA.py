@@ -22,11 +22,14 @@ Without a file it simulates an antenna (series RLC resonant at 14.2 MHz
 behind 1 m of coax) on S11 and a band-pass filter on S21. With a
 Touchstone file it replays the file, interpolated to the requested
 frequencies. Enable with `--virtual [file]`; it then appears as port
-"virtual" in the port list.
+"virtual" in the port list. `--virtual-seed N` draws the antenna and
+filter from N instead (Params.from_seed), so an evaluation run cannot
+be answered from memory of the default values.
 """
 
 import logging
 import math
+from dataclasses import dataclass
 from time import sleep
 
 import numpy as np
@@ -48,12 +51,47 @@ COAX_M = 1.0
 VF = 0.66
 F_FILTER = 145e6  # band-pass centre
 Q_FILTER = 8.0
+GAIN_FILTER = 0.95
 
 
-def enable(source: str | None = None) -> None:
-    global ENABLED, SOURCE  # noqa: PLW0603  pylint: disable=global-statement
+@dataclass(frozen=True)
+class Params:
+    """The simulated antenna (S11) and band-pass filter (S21)."""
+
+    f0: float = F0
+    r_ant: float = R_ANT
+    q_ant: float = Q_ANT
+    coax_m: float = COAX_M
+    vf: float = VF
+    f_filter: float = F_FILTER
+    q_filter: float = Q_FILTER
+    gain: float = GAIN_FILTER
+
+    @classmethod
+    def from_seed(cls, seed: int) -> "Params":
+        """Random but reproducible values. The ranges keep the antenna
+        inside 3-30 MHz and the filter's -3 dB band inside 100-200 MHz,
+        the ranges the evaluation tasks name."""
+        rng = np.random.default_rng(seed)
+        return cls(
+            f0=round(rng.uniform(4e6, 28e6), -3),
+            r_ant=round(rng.uniform(25.0, 75.0), 1),
+            q_ant=round(rng.uniform(6.0, 20.0), 1),
+            coax_m=round(rng.uniform(0.5, 3.0), 2),
+            f_filter=round(rng.uniform(115e6, 185e6), -4),
+            q_filter=round(rng.uniform(5.0, 12.0), 1),
+            gain=round(rng.uniform(0.7, 0.98), 3),
+        )
+
+
+PARAMS = Params()
+
+
+def enable(source: str | None = None, seed: int | None = None) -> None:
+    global ENABLED, SOURCE, PARAMS  # noqa: PLW0603  pylint: disable=global-statement
     ENABLED = True
     SOURCE = source
+    PARAMS = Params() if seed is None else Params.from_seed(seed)
 
 
 def make_interface() -> "VirtualInterface":
@@ -78,17 +116,20 @@ class VirtualInterface(Interface):
         pass
 
 
-def model(freqs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def model(
+    freqs: np.ndarray, p: Params | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    p = p or PARAMS
     w = 2 * math.pi * freqs
-    w0 = 2 * math.pi * F0
-    ind = Q_ANT * R_ANT / w0
+    w0 = 2 * math.pi * p.f0
+    ind = p.q_ant * p.r_ant / w0
     cap = 1 / (w0 * w0 * ind)
-    z = R_ANT + 1j * (w * ind - 1 / (w * cap))
+    z = p.r_ant + 1j * (w * ind - 1 / (w * cap))
     gamma = (z - 50) / (z + 50)
-    delay = 2 * COAX_M / (VF * 299_792_458)
+    delay = 2 * p.coax_m / (p.vf * 299_792_458)
     s11 = gamma * np.exp(-1j * w * delay)
-    x = Q_FILTER * (freqs / F_FILTER - F_FILTER / freqs)
-    s21 = 0.95 / (1 + 1j * x) ** 2
+    x = p.q_filter * (freqs / p.f_filter - p.f_filter / freqs)
+    s21 = p.gain / (1 + 1j * x) ** 2
     return s11, s21
 
 

@@ -141,6 +141,23 @@ def test_measure_virtual_antenna(saver):
     assert [e.tool for e in log if e.outcome == "ok"][-1] == "sweep_run"
 
 
+def test_marker_set_reports_new_frequency(saver):
+    _, window, _ = saver
+    window.mcp.control.allow(True)
+    call(saver, "device_connect", {"port": "virtual"})
+    # same sweep as test_measure_virtual_antenna; later tests expect 202 points
+    call(saver, "sweep_configure",
+         {"start_hz": 10_000_000, "stop_hz": 20_000_000, "segments": 2})
+    call(saver, "sweep_run")
+    call(saver, "marker_set", {"index": 0, "freq_hz": 14_200_000})
+    result = call(saver, "marker_list")
+    assert not is_error(result)
+    # list results come as one content item per element
+    markers = [json.loads(c.text) for c in result.content]
+    first = next(m for m in markers if m["index"] == 0)
+    assert first["freq_hz"] == first["s11"]["freq_hz"]
+    assert abs(first["freq_hz"] - 14_200_000) <= 50_000
+
 def test_chart_image(saver):
     result = call(saver, "chart_image", {"chart": "s11.smith"})
     assert not is_error(result)

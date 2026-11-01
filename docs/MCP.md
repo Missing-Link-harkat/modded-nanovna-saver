@@ -65,6 +65,11 @@ python -m NanoVNASaver --virtual --mcp http --mcp-allow
 
 ## Turvallisuus
 
+| AI ohjaa | STOP painettu |
+|---|---|
+| ![AI ohjaa](kuvat/mcp-paneeli-ai-ohjaa.png) | ![STOP](kuvat/mcp-paneeli-stop.png) |
+
+
 | taso | mitä | ehto |
 |---|---|---|
 | **read** | tilan ja datan lukeminen, kaaviot, analyysit | aina, kun palvelin on käynnissä |
@@ -125,11 +130,77 @@ Täysi data on saatavilla **resursseina**, jotta mallin konteksti ei täyty tuha
   widgetteihin suoraan.
 - `tests/test_mcp_e2e.py` ajaa MCP-asiakkaan virtuaalilaitetta vastaan (yhdistäminen,
   pyyhkäisy, kuvat, kuittaukset, kalibrointi, STOP).
+- `tests/test_mcp_panel.py` käy AI-paneelin läpi oikeassa pääikkunassa (palvelinnappi,
+  Kopioi, "Salli AI-ohjaus", tila AI:n toimiessa, STOP, Ctrl+Shift+S, loki).
+  `MCP_PANEL_SHOTS=<kansio>` tallentaa paneelista kuvan jokaisessa vaiheessa
+  (offscreen-tilassa lisää `QT_QPA_FONTDIR`, esim. `C:/Windows/Fonts`, muuten tekstit
+  ovat laatikoita).
+
+## Arviointisarja: kuinka usein malli onnistuu
+
+`tests/mcp_eval/` mittaa oikealla mallilla, kuinka usein se saa tehtävän oikein näillä
+työkaluilla. Jokainen ajo käynnistää puhtaan ikkunattoman Saverin virtuaalilaitteella,
+antaa mallille yhden tehtävän, kaikki MCP-työkalut ja Saverin palvelinohjeet (kuten oikeat
+asiakkaat), ja tarkistaa vastauksen.
+
+| tehtävä | mitä kysytään | toleranssi | mittauksen on katettava |
+|---|---|---|---|
+| `antenni_resonanssi` | taajuus, jolla antennin VSWR on pienin 3–30 MHz | ±1 % | resonanssi |
+| `antenni_vswr` | pienin VSWR | ±0,05 | resonanssi |
+| `suodatin_keskitaajuus` | taajuus, jolla S21 on suurin 100–200 MHz | ±1 % | keskitaajuus |
+| `suodatin_kaista` | −3 dB:n kaistanleveys | ±5 % | keskitaajuus |
+| `suodatin_vaimennus` | S21 annetulla taajuudella | ±0,2 dB | kysytty taajuus |
+| `markkeri_resonanssiin` | markkeri 1 pienimpään VSWR:ään (tarkistetaan Saverin tilasta) | ±1 % | resonanssi |
+
+**Laite arvotaan jokaiseen ajoon.** Ajo *i* käynnistää Saverin `--virtual-seed <seed+i>`,
+jolloin antennin resonanssi (4–28 MHz), resistanssi, Q, syöttökaapeli sekä suodattimen
+keskitaajuus (115–185 MHz), Q ja vahvistus arvotaan siemenestä
+(`VirtualVNA.Params.from_seed`). Oikeat vastaukset lasketaan samoista parametreista
+(`VirtualVNA.model`), ei kirjoiteta käsin. Kiinteällä laitteella (14,2 MHz, 20 metrin
+bändi) malli voisi vastata oikein muistista. Sama siemen kaikille malleille, joten mallit
+kohtaavat samat laitteet. Siemen tallentuu riville.
+
+**Oikea arvo ei riitä, sen on oltava mitattu.** `pass` vaatii, että vastaus on toleranssissa
+**ja** pyyhkäisy kattoi taajuuden, josta vastaus riippuu. Pyyhkäisyksi lasketaan
+`sweep_run` ja myös `device_connect`, joka pyyhkäisee laitteen nykyisen alueen
+(virtuaalilaitteella 3,6–30 MHz) ja palauttaa yhteenvedon. Muuten tulos on
+`fail` syyllä `ei mitattu (arvaus osui)` tai `ei mitattu`. Muut syyt: `väärä arvo` ja
+`ei vastausta`. Yhteenvedon sarake "arvaus osui" laskee arvaukset, jotka vanha tarkistin
+olisi hyväksynyt.
+
+Malli vastaa rivillä `VASTAUS: <luku> <yksikkö>`.
+
+```
+python tests/mcp_eval/run_eval.py --model qwen3-coder:30b \
+    --base-url http://<ollama>:11434 --n 10 --jobs 3 --out tulokset.jsonl
+python tests/mcp_eval/run_eval.py --summary tulokset.jsonl
+```
+
+- `--backend ollama` (oletus) käyttää Ollaman omaa rajapintaa ja asettaa kontekstin
+  (`--num-ctx`, oletus 32768), koska 41 työkalun kuvaukset eivät mahdu 4k:n oletukseen.
+  `--backend openai` + `--base-url …/v1` + `--api-key-env <muuttuja>` toimii minkä tahansa
+  OpenAI-yhteensopivan rajapinnan kanssa (avain luetaan ympäristömuuttujasta).
+- Jokainen ajo tallentuu JSONL-riviksi: malli, tehtävä, siemen, totuus, vastaus,
+  pyyhkäisyjen alueet, kutsutut työkalut, vuorot, tokenit, kesto ja `reason`.
+- Tulos on **kolme tilaa**: `pass`, `fail` (malli vastasi väärin, ei vastannut tai ei
+  mitannut) ja `error` (ajo itse hajosi: mallipalvelin, Saver tai aikaraja). Virhe-ajot
+  raportoidaan erikseen eikä niitä lasketa mallin onnistumisiin tai epäonnistumisiin.
+- Yhteysvirhe mallipalvelimeen (`URLError`, `ConnectionResetError` …) yritetään kerran
+  uudelleen, ja rivin `retried`-kenttä kertoo sen. Aikakatkaisua ei uusita: se voi olla
+  mallin hitautta.
+- `--ohje off` poistaa järjestelmäkehotteesta lauseen "Mittaa aina itse työkaluilla; älä
+  arvaa." A/B-koe: auttaako kehotus mallia mittaamaan. Rivin `ohje`-kenttä kertoo
+  kumpi.
+- Raportoi aste (esim. 8/10), ei kyllä/ei. n = 10 ei erota 90 %:a 100 %:sta.
+- `--jobs` > 1 ajaa ajoja rinnakkain (kukin oma Saver). Kesto sisältää silloin myös
+  mallipalvelimen jonon, joten kestoja ei voi verrata eri `--jobs`-arvoilla.
+- `tests/mcp_eval/test_eval_tasks.py` (CI) tarkistaa oikeat vastaukset ja jäsentimen
+  ilman mallia.
 
 ## Ei vielä tehty
 
-- Arviointisarja oikealla mallilla: tehtävät, joissa mitataan kuinka usein malli onnistuu
-  (n ≥ 10 per tehtävä). Kuuluu #93:een.
+- Arviointisarjan ajo pilvimallilla (ajuri tukee, avain puuttuu) ja kalibrointitehtävä,
+  jossa vahvistus simuloidaan.
 - Kaistataulukon muokkaus, mittaustiedostoihin perustuvat kalibrointistandardit ja
   kalibrointisarjojen tallennus (rajattu pois, ks. `inventory.py`).
 - Oikealla LiteVNA:lla todentaminen, joka odottaa laitteen tunnistusta (#19).
