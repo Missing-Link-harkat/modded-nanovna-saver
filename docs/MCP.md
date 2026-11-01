@@ -125,11 +125,55 @@ Täysi data on saatavilla **resursseina**, jotta mallin konteksti ei täyty tuha
   widgetteihin suoraan.
 - `tests/test_mcp_e2e.py` ajaa MCP-asiakkaan virtuaalilaitetta vastaan (yhdistäminen,
   pyyhkäisy, kuvat, kuittaukset, kalibrointi, STOP).
+- `tests/test_mcp_panel.py` käy AI-paneelin läpi oikeassa pääikkunassa (palvelinnappi,
+  Kopioi, "Salli AI-ohjaus", tila AI:n toimiessa, STOP, Ctrl+Shift+S, loki).
+  `MCP_PANEL_SHOTS=<kansio>` tallentaa paneelista kuvan jokaisessa vaiheessa
+  (offscreen-tilassa lisää `QT_QPA_FONTDIR`, esim. `C:/Windows/Fonts`, muuten tekstit
+  ovat laatikoita).
+
+## Arviointisarja: kuinka usein malli onnistuu
+
+`tests/mcp_eval/` mittaa oikealla mallilla, kuinka usein se saa tehtävän oikein näillä
+työkaluilla. Jokainen ajo käynnistää puhtaan ikkunattoman Saverin virtuaalilaitteella,
+antaa mallille yhden tehtävän ja kaikki MCP-työkalut, ja tarkistaa vastauksen.
+
+| tehtävä | mitä kysytään | oikea vastaus | toleranssi |
+|---|---|---|---|
+| `antenni_resonanssi` | antennin resonanssi 3–30 MHz | 14,2 MHz | ±1 % |
+| `antenni_vswr` | pienin VSWR | 1,19 | ±0,05 |
+| `suodatin_keskitaajuus` | suodattimen keskitaajuus 100–200 MHz | 145 MHz | ±1 % |
+| `suodatin_kaista` | −3 dB:n kaistanleveys | 11,66 MHz | ±5 % |
+| `suodatin_vaimennus` | S21 taajuudella 145 MHz | −0,45 dB | ±0,2 dB |
+| `markkeri_resonanssiin` | markkeri 1 resonanssiin (tarkistetaan Saverin tilasta) | 14,2 MHz | ±1 % |
+
+Oikeat vastaukset lasketaan virtuaalilaitteen mallista (`VirtualVNA.model`), ei kirjoiteta
+käsin. Malli vastaa rivillä `VASTAUS: <luku> <yksikkö>`.
+
+```
+python tests/mcp_eval/run_eval.py --model qwen3-coder:30b \
+    --base-url http://<ollama>:11434 --n 10 --jobs 3 --out tulokset.jsonl
+python tests/mcp_eval/run_eval.py --summary tulokset.jsonl
+```
+
+- `--backend ollama` (oletus) käyttää Ollaman omaa rajapintaa ja asettaa kontekstin
+  (`--num-ctx`, oletus 32768), koska 41 työkalun kuvaukset eivät mahdu 4k:n oletukseen.
+  `--backend openai` + `--base-url …/v1` + `--api-key-env <muuttuja>` toimii minkä tahansa
+  OpenAI-yhteensopivan rajapinnan kanssa (avain luetaan ympäristömuuttujasta).
+- Jokainen ajo tallentuu JSONL-riviksi: malli, tehtävä, vastaus, kutsutut työkalut,
+  vuorot, tokenit ja kesto.
+- Tulos on **kolme tilaa**: `pass`, `fail` (malli vastasi väärin tai ei lainkaan) ja
+  `error` (ajo itse hajosi: mallipalvelin, Saver tai aikaraja). Virhe-ajot raportoidaan
+  erikseen eikä niitä lasketa mallin onnistumisiin tai epäonnistumisiin.
+- Raportoi aste (esim. 8/10), ei kyllä/ei. n = 10 ei erota 90 %:a 100 %:sta.
+- `--jobs` > 1 ajaa ajoja rinnakkain (kukin oma Saver). Kesto sisältää silloin myös
+  mallipalvelimen jonon, joten kestoja ei voi verrata eri `--jobs`-arvoilla.
+- `tests/mcp_eval/test_eval_tasks.py` (CI) tarkistaa oikeat vastaukset ja jäsentimen
+  ilman mallia.
 
 ## Ei vielä tehty
 
-- Arviointisarja oikealla mallilla: tehtävät, joissa mitataan kuinka usein malli onnistuu
-  (n ≥ 10 per tehtävä). Kuuluu #93:een.
+- Arviointisarjan ajo pilvimallilla (ajuri tukee, avain puuttuu) ja kalibrointitehtävä,
+  jossa vahvistus simuloidaan.
 - Kaistataulukon muokkaus, mittaustiedostoihin perustuvat kalibrointistandardit ja
   kalibrointisarjojen tallennus (rajattu pois, ks. `inventory.py`).
 - Oikealla LiteVNA:lla todentaminen, joka odottaa laitteen tunnistusta (#19).
