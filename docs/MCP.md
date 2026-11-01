@@ -140,19 +140,35 @@ Täysi data on saatavilla **resursseina**, jotta mallin konteksti ei täyty tuha
 
 `tests/mcp_eval/` mittaa oikealla mallilla, kuinka usein se saa tehtävän oikein näillä
 työkaluilla. Jokainen ajo käynnistää puhtaan ikkunattoman Saverin virtuaalilaitteella,
-antaa mallille yhden tehtävän ja kaikki MCP-työkalut, ja tarkistaa vastauksen.
+antaa mallille yhden tehtävän, kaikki MCP-työkalut ja Saverin palvelinohjeet (kuten oikeat
+asiakkaat), ja tarkistaa vastauksen.
 
-| tehtävä | mitä kysytään | oikea vastaus | toleranssi |
+| tehtävä | mitä kysytään | toleranssi | mittauksen on katettava |
 |---|---|---|---|
-| `antenni_resonanssi` | antennin resonanssi 3–30 MHz | 14,2 MHz | ±1 % |
-| `antenni_vswr` | pienin VSWR | 1,19 | ±0,05 |
-| `suodatin_keskitaajuus` | suodattimen keskitaajuus 100–200 MHz | 145 MHz | ±1 % |
-| `suodatin_kaista` | −3 dB:n kaistanleveys | 11,66 MHz | ±5 % |
-| `suodatin_vaimennus` | S21 taajuudella 145 MHz | −0,45 dB | ±0,2 dB |
-| `markkeri_resonanssiin` | markkeri 1 resonanssiin (tarkistetaan Saverin tilasta) | 14,2 MHz | ±1 % |
+| `antenni_resonanssi` | taajuus, jolla antennin VSWR on pienin 3–30 MHz | ±1 % | resonanssi |
+| `antenni_vswr` | pienin VSWR | ±0,05 | resonanssi |
+| `suodatin_keskitaajuus` | taajuus, jolla S21 on suurin 100–200 MHz | ±1 % | keskitaajuus |
+| `suodatin_kaista` | −3 dB:n kaistanleveys | ±5 % | keskitaajuus |
+| `suodatin_vaimennus` | S21 annetulla taajuudella | ±0,2 dB | kysytty taajuus |
+| `markkeri_resonanssiin` | markkeri 1 pienimpään VSWR:ään (tarkistetaan Saverin tilasta) | ±1 % | resonanssi |
 
-Oikeat vastaukset lasketaan virtuaalilaitteen mallista (`VirtualVNA.model`), ei kirjoiteta
-käsin. Malli vastaa rivillä `VASTAUS: <luku> <yksikkö>`.
+**Laite arvotaan jokaiseen ajoon.** Ajo *i* käynnistää Saverin `--virtual-seed <seed+i>`,
+jolloin antennin resonanssi (4–28 MHz), resistanssi, Q, syöttökaapeli sekä suodattimen
+keskitaajuus (115–185 MHz), Q ja vahvistus arvotaan siemenestä
+(`VirtualVNA.Params.from_seed`). Oikeat vastaukset lasketaan samoista parametreista
+(`VirtualVNA.model`), ei kirjoiteta käsin. Kiinteällä laitteella (14,2 MHz, 20 metrin
+bändi) malli voisi vastata oikein muistista. Sama siemen kaikille malleille, joten mallit
+kohtaavat samat laitteet. Siemen tallentuu riville.
+
+**Oikea arvo ei riitä, sen on oltava mitattu.** `pass` vaatii, että vastaus on toleranssissa
+**ja** pyyhkäisy kattoi taajuuden, josta vastaus riippuu. Pyyhkäisyksi lasketaan
+`sweep_run` ja myös `device_connect`, joka pyyhkäisee laitteen nykyisen alueen
+(virtuaalilaitteella 3,6–30 MHz) ja palauttaa yhteenvedon. Muuten tulos on
+`fail` syyllä `ei mitattu (arvaus osui)` tai `ei mitattu`. Muut syyt: `väärä arvo` ja
+`ei vastausta`. Yhteenvedon sarake "arvaus osui" laskee arvaukset, jotka vanha tarkistin
+olisi hyväksynyt.
+
+Malli vastaa rivillä `VASTAUS: <luku> <yksikkö>`.
 
 ```
 python tests/mcp_eval/run_eval.py --model qwen3-coder:30b \
@@ -164,11 +180,17 @@ python tests/mcp_eval/run_eval.py --summary tulokset.jsonl
   (`--num-ctx`, oletus 32768), koska 41 työkalun kuvaukset eivät mahdu 4k:n oletukseen.
   `--backend openai` + `--base-url …/v1` + `--api-key-env <muuttuja>` toimii minkä tahansa
   OpenAI-yhteensopivan rajapinnan kanssa (avain luetaan ympäristömuuttujasta).
-- Jokainen ajo tallentuu JSONL-riviksi: malli, tehtävä, vastaus, kutsutut työkalut,
-  vuorot, tokenit ja kesto.
-- Tulos on **kolme tilaa**: `pass`, `fail` (malli vastasi väärin tai ei lainkaan) ja
-  `error` (ajo itse hajosi: mallipalvelin, Saver tai aikaraja). Virhe-ajot raportoidaan
-  erikseen eikä niitä lasketa mallin onnistumisiin tai epäonnistumisiin.
+- Jokainen ajo tallentuu JSONL-riviksi: malli, tehtävä, siemen, totuus, vastaus,
+  pyyhkäisyjen alueet, kutsutut työkalut, vuorot, tokenit, kesto ja `reason`.
+- Tulos on **kolme tilaa**: `pass`, `fail` (malli vastasi väärin, ei vastannut tai ei
+  mitannut) ja `error` (ajo itse hajosi: mallipalvelin, Saver tai aikaraja). Virhe-ajot
+  raportoidaan erikseen eikä niitä lasketa mallin onnistumisiin tai epäonnistumisiin.
+- Yhteysvirhe mallipalvelimeen (`URLError`, `ConnectionResetError` …) yritetään kerran
+  uudelleen, ja rivin `retried`-kenttä kertoo sen. Aikakatkaisua ei uusita: se voi olla
+  mallin hitautta.
+- `--ohje off` poistaa järjestelmäkehotteesta lauseen "Mittaa aina itse työkaluilla; älä
+  arvaa." A/B-koe: auttaako kehotus mallia mittaamaan. Rivin `ohje`-kenttä kertoo
+  kumpi.
 - Raportoi aste (esim. 8/10), ei kyllä/ei. n = 10 ei erota 90 %:a 100 %:sta.
 - `--jobs` > 1 ajaa ajoja rinnakkain (kukin oma Saver). Kesto sisältää silloin myös
   mallipalvelimen jonon, joten kestoja ei voi verrata eri `--jobs`-arvoilla.

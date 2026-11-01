@@ -19,12 +19,17 @@
 """Run the MCP evaluation: a real model drives headless Saver.
 
 Each run starts a fresh `python -m NanoVNASaver --headless --mcp stdio
---virtual` and gives the model one task and all of Saver's MCP tools.
+--virtual --virtual-seed N` and gives the model one task, all of
+Saver's MCP tools and Saver's server instructions (as real clients do).
+Run i uses seed --seed + i for every model and task, so models are
+compared on the same simulated devices.
 Every run is appended to a JSONL file; `--summary` turns a file into a
 table. Three outcomes are kept apart: pass, fail (the model answered
 wrong or not at all) and error (the run itself broke: model server down,
 Saver crashed, timeout), so a broken run is never counted as the
-model's failure or success.
+model's failure or success. A connection error to the model server is
+retried once (the row says so); a timeout is not, since it may be the
+model being slow.
 
 Backends: "ollama" (native /api/chat, sets the context length so all
 tool schemas fit) and "openai" (any OpenAI compatible
@@ -54,14 +59,22 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(HERE))
 
 from mcp import Client, StdioServerParameters  # noqa: E402
-from tasks import TASKS, Task, parse_answer  # noqa: E402
+from tasks import TASKS, Task, parse_answer, tasks_for  # noqa: E402
 
 SYSTEM = (
     "Ohjaat NanoVNA-Saver-ohjelmaa ja siihen kytkettyä vektoriverkko-"
-    "analysaattoria työkaluilla. Mittaa aina itse työkaluilla; älä arvaa. "
+    "analysaattoria työkaluilla.{ohje} "
     "Jos laitetta ei ole yhdistetty, etsi portti ja yhdistä se ensin. "
     "Vastaa suomeksi."
 )
+# --ohje on/off: the A/B variable for "does telling the model not to
+# guess make it measure"
+OHJE = " Mittaa aina itse työkaluilla; älä arvaa."
+# Tools whose result is a data summary of a sweep they ran:
+# device_connect sweeps the device's current range right after connecting.
+SWEEPING = ("sweep_run", "device_connect")
+TRANSIENT = ("URLError", "ConnectionResetError", "ConnectionRefusedError",
+             "RemoteDisconnected", "IncompleteRead")
 MAX_RESULT_CHARS = 6000
 
 
@@ -165,19 +178,34 @@ async def read_state(client, check: str) -> float | None:
     return None
 
 
-async def run_once(task: Task, backend: Backend, max_turns: int) -> dict:
+def sweep_range(text: str) -> tuple[float, float] | None:
+    """start/stop of the sweep summarised in a SWEEPING tool's result,
+    else None (e.g. device_connect when no sweep ran)."""
+    try:
+        out = json.loads(text)
+        return float(out["start_hz"]), float(out["stop_hz"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+async def run_once(task: Task, backend: Backend, max_turns: int,
+                   seed: int, ohje: bool) -> dict:
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "NanoVNASaver", "--headless", "--mcp", "stdio",
-              "--virtual"],
+              "--virtual", "--virtual-seed", str(seed)],
         env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
              "QT_QPA_PLATFORM": "offscreen"},
         cwd=str(ROOT),
     )
-    rec: dict = {"tools": [], "turns": 0, "tokens": 0, "answer": ""}
+    rec: dict = {"tools": [], "turns": 0, "tokens": 0, "answer": "",
+                 "sweeps": []}
     async with Client(params) as client:
         specs = tool_specs((await client.list_tools()).tools)
-        messages = [{"role": "system", "content": SYSTEM},
+        system = SYSTEM.format(ohje=OHJE if ohje else "")
+        if client.instructions:
+            system += "\n\n" + client.instructions
+        messages = [{"role": "system", "content": system},
                     {"role": "user", "content": task.prompt}]
         for _ in range(max_turns):
             rec["turns"] += 1
@@ -197,6 +225,10 @@ async def run_once(task: Task, backend: Backend, max_turns: int) -> dict:
                     text = result_text(res)
                 except Exception as exc:  # pylint: disable=broad-except
                     text = f"VIRHE: {exc}"
+                if name in SWEEPING and not text.startswith("VIRHE"):
+                    span = sweep_range(text)
+                    if span:
+                        rec["sweeps"].append(span)
                 messages.append(backend.tool_message(call_id, name, text))
         else:
             rec["stopped"] = "max_turns"
@@ -214,14 +246,23 @@ def describe(exc: BaseException) -> str:
 
 
 def score(task: Task, rec: dict) -> dict:
+    """pass needs both the right value and a sweep that covered
+    task.at_hz; "reason" tells a guess from a wrong measurement."""
     value = parse_answer(rec["answer"], task.unit)
-    if task.state_check:
-        checked = rec.get("state")
-        passed = task.ok(checked)
+    checked = rec.get("state") if task.state_check else value
+    measured = task.at_hz is None or any(
+        lo <= task.at_hz <= hi for lo, hi in rec.get("sweeps", []))
+    right = task.ok(checked)
+    if checked is None:
+        reason = "ei vastausta"
+    elif not measured:
+        reason = "ei mitattu" + (" (arvaus osui)" if right else "")
+    elif not right:
+        reason = "väärä arvo"
     else:
-        checked = value
-        passed = task.ok(value)
-    return {"value": value, "checked": checked, "pass": passed}
+        reason = ""
+    return {"value": value, "checked": checked, "measured": measured,
+            "pass": right and measured, "reason": reason}
 
 
 def run(args) -> None:
@@ -232,21 +273,32 @@ def run(args) -> None:
     lock = threading.Lock()
 
     def one(i: int, key: str) -> None:
-        task = TASKS[key]
+        seed = args.seed + i
+        task = tasks_for(seed)[key]
         row = {"model": args.model, "backend": args.backend,
-               "task": key, "i": i, "truth": task.truth,
-               "tol": task.tolerance(), "jobs": args.jobs,
+               "task": key, "i": i, "seed": seed, "ohje": args.ohje,
+               "truth": task.truth, "tol": task.tolerance(),
+               "at_hz": task.at_hz, "jobs": args.jobs,
                "started": time.time()}
         t0 = time.monotonic()
-        try:
-            rec = asyncio.run(asyncio.wait_for(
-                run_once(task, backend, args.max_turns), args.run_timeout))
-            row.update(rec)
-            row.update(score(task, rec))
-            row["outcome"] = "pass" if row["pass"] else "fail"
-        except Exception as exc:  # pylint: disable=broad-except
-            row["outcome"] = "error"
-            row["error"] = describe(exc)[:1000]
+        for attempt in (1, 2):
+            try:
+                rec = asyncio.run(asyncio.wait_for(
+                    run_once(task, backend, args.max_turns, seed,
+                             args.ohje == "on"),
+                    args.run_timeout))
+                row.update(rec)
+                row.update(score(task, rec))
+                row["outcome"] = "pass" if row["pass"] else "fail"
+                row.pop("error", None)
+                break
+            except Exception as exc:  # pylint: disable=broad-except
+                row["outcome"] = "error"
+                row["error"] = describe(exc)[:1000]
+                if attempt == 1 and row["error"].startswith(TRANSIENT):
+                    row["retried"] = row["error"]
+                    continue
+                break
         row["duration_s"] = round(time.monotonic() - t0, 1)
         with lock, out.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -268,19 +320,22 @@ def summary(path: str) -> str:
     for r in rows:
         groups[(r["model"], r["task"])].append(r)
     lines = [
-        "| malli | tehtävä | onnistui | virhe-ajot | mediaani s | "
-        "työkalukutsuja (ka) |",
-        "|---|---|---|---|---|---|",
+        "| malli | tehtävä | onnistui | arvaus osui | virhe-ajot | "
+        "mediaani s | työkalukutsuja (ka) |",
+        "|---|---|---|---|---|---|---|",
     ]
     for (model, task), rs in sorted(groups.items()):
         ok = [r for r in rs if r["outcome"] != "error"]
         passed = sum(r["outcome"] == "pass" for r in ok)
+        # rows from before the measurement rule have no "reason"
+        guessed = sum(r.get("reason") == "ei mitattu (arvaus osui)"
+                      for r in ok)
         errors = len(rs) - len(ok)
         rate = f"{passed}/{len(ok)}" if ok else "–"
         dur = statistics.median(r["duration_s"] for r in rs)
         calls = (statistics.mean(len(r["tools"]) for r in ok)
                  if ok else float("nan"))
-        lines.append(f"| {model} | {task} | {rate} | {errors} | "
+        lines.append(f"| {model} | {task} | {rate} | {guessed} | {errors} | "
                      f"{dur:.0f} | {calls:.1f} |")
     return "\n".join(lines)
 
@@ -302,6 +357,10 @@ def main() -> None:
     p.add_argument("--num-ctx", type=int, default=32768)
     p.add_argument("--call-timeout", type=float, default=300)
     p.add_argument("--run-timeout", type=float, default=900)
+    p.add_argument("--seed", type=int, default=1000,
+                   help="run i simulates the device drawn from seed + i")
+    p.add_argument("--ohje", choices=("on", "off"), default="on",
+                   help='"measure, do not guess" in the system prompt')
     p.add_argument("--out", default="mcp_eval_results.jsonl")
     p.add_argument("--summary", metavar="JSONL")
     args = p.parse_args()

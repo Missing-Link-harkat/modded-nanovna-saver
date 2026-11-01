@@ -20,9 +20,16 @@
 
 Every task is answered against the virtual VNA without a file, so the
 correct answer is computed from VirtualVNA.model() itself, not typed in
-by hand. A task passes when the model's final line
-"VASTAUS: <number> <unit>" is within the tolerance of the truth, or for
-an action task when Saver's state afterwards is right.
+by hand. With a seed (tasks_for) the antenna and filter are drawn from
+VirtualVNA.Params.from_seed, the same values Saver simulates with
+`--virtual-seed`, so the answer cannot come from memory.
+
+A task passes when the model's final line "VASTAUS: <number> <unit>"
+(or for an action task, Saver's state afterwards) is within the
+tolerance of the truth AND a sweep (sweep_run, or the one
+device_connect runs) covered the frequency the answer depends on
+(Task.at_hz): a right number without a measurement is a guess, not a
+pass.
 """
 
 import math
@@ -51,6 +58,8 @@ class Task:
     # For action tasks: reads Saver's state through the MCP session and
     # returns the value to compare instead of the model's answer.
     state_check: str | None = None
+    # A sweep must have covered this frequency for the answer to count.
+    at_hz: float | None = None
     notes: list[str] = field(default_factory=list)
 
     def tolerance(self) -> float:
@@ -86,27 +95,33 @@ def _fine(start: float, stop: float, n: int = 200_001) -> np.ndarray:
     return np.linspace(start, stop, n)
 
 
-def _antenna() -> tuple[float, float]:
-    f = _fine(10e6, 20e6)
-    s11, _ = VirtualVNA.model(f)
+def _antenna(p: VirtualVNA.Params) -> tuple[float, float]:
+    f = _fine(3e6, 30e6)
+    s11, _ = VirtualVNA.model(f, p)
     i = int(np.argmin(np.abs(s11)))
     g = abs(s11[i])
     return float(f[i]), float((1 + g) / (1 - g))
 
 
-def _filter() -> tuple[float, float, float]:
+def _filter(p: VirtualVNA.Params) -> tuple[float, float]:
     f = _fine(100e6, 200e6)
-    _, s21 = VirtualVNA.model(f)
+    _, s21 = VirtualVNA.model(f, p)
     mag = np.abs(s21)
     i = int(np.argmax(mag))
     band = f[mag >= mag[i] / math.sqrt(2)]
-    s21_db = 20 * math.log10(abs(VirtualVNA.model(np.array([145e6]))[1][0]))
-    return float(f[i]), float(band[-1] - band[0]), s21_db
+    return float(f[i]), float(band[-1] - band[0])
 
 
-def build_tasks() -> list[Task]:
-    f_res, vswr_min = _antenna()
-    f_c, bw, s21_db = _filter()
+def _s21_db(p: VirtualVNA.Params, freq: float) -> float:
+    return 20 * math.log10(abs(VirtualVNA.model(np.array([freq]), p)[1][0]))
+
+
+def build_tasks(p: VirtualVNA.Params | None = None) -> list[Task]:
+    p = p or VirtualVNA.Params()
+    f_res, vswr_min = _antenna(p)
+    f_c, bw = _filter(p)
+    # a whole-MHz point on the filter's upper slope
+    f_meas = round(p.f_filter * 1.03 / 1e6) * 1e6
     tail = (
         " Lopeta vastauksesi rivillä muodossa "
         "'VASTAUS: <luku> <yksikkö>'."
@@ -114,47 +129,53 @@ def build_tasks() -> list[Task]:
     return [
         Task(
             "antenni_resonanssi",
-            "Laitteeseen on kytketty HF-antenni. Mikä on sen "
-            "resonanssitaajuus (pienin VSWR) 3–30 MHz:n alueella?" + tail,
-            f_res, "Hz", rel_tol=0.01,
+            "Laitteeseen on kytketty HF-antenni. Millä taajuudella sen "
+            "VSWR on pienin 3–30 MHz:n alueella?" + tail,
+            f_res, "Hz", rel_tol=0.01, at_hz=f_res,
         ),
         Task(
             "antenni_vswr",
             "Laitteeseen on kytketty HF-antenni. Mikä on sen pienin VSWR "
             "3–30 MHz:n alueella? Anna VSWR pelkkänä lukuna ilman "
             "yksikköä." + tail,
-            vswr_min, "", abs_tol=0.05,
+            vswr_min, "", abs_tol=0.05, at_hz=f_res,
         ),
         Task(
             "suodatin_keskitaajuus",
             "Laitteen porttien välissä on kaistanpäästösuodatin jossain "
-            "100–200 MHz:n välillä. Mikä on sen keskitaajuus "
-            "(suurin S21)?" + tail,
-            f_c, "Hz", rel_tol=0.01,
+            "100–200 MHz:n välillä. Millä taajuudella sen läpäisy (S21) "
+            "on suurin?" + tail,
+            f_c, "Hz", rel_tol=0.01, at_hz=f_c,
         ),
         Task(
             "suodatin_kaista",
             "Laitteen porttien välissä on kaistanpäästösuodatin jossain "
             "100–200 MHz:n välillä. Mikä on sen −3 dB:n kaistanleveys?"
             + tail,
-            bw, "Hz", rel_tol=0.05,
+            bw, "Hz", rel_tol=0.05, at_hz=f_c,
         ),
         Task(
             "suodatin_vaimennus",
-            "Mittaa suodattimen läpäisy (S21) taajuudella 145 MHz "
-            "desibeleinä." + tail,
-            s21_db, "dB", abs_tol=0.2,
+            "Laitteen porttien välissä on suodatin. Mittaa sen läpäisy "
+            f"(S21) taajuudella {f_meas / 1e6:.0f} MHz desibeleinä." + tail,
+            _s21_db(p, f_meas), "dB", abs_tol=0.2, at_hz=f_meas,
         ),
         Task(
             "markkeri_resonanssiin",
-            "Laitteeseen on kytketty HF-antenni. Etsi sen "
-            "resonanssitaajuus 3–30 MHz:n alueelta ja siirrä markkeri 1 "
+            "Laitteeseen on kytketty HF-antenni. Etsi taajuus, jolla sen "
+            "VSWR on pienin 3–30 MHz:n alueella, ja siirrä markkeri 1 "
             "(indeksi 0) täsmälleen siihen. Kerro lopuksi markkerin "
             "taajuus." + tail,
             f_res, "Hz", rel_tol=0.01, state_check="marker0_hz",
+            at_hz=f_res,
         ),
     ]
 
 
-TASKS: dict[str, Task] = {t.key: t for t in build_tasks()}
+def tasks_for(seed: int | None) -> dict[str, Task]:
+    params = None if seed is None else VirtualVNA.Params.from_seed(seed)
+    return {t.key: t for t in build_tasks(params)}
+
+
+TASKS: dict[str, Task] = tasks_for(None)
 StateReader = Callable[[str], float | None]
