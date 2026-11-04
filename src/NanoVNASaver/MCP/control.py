@@ -22,8 +22,15 @@ Rules:
   * AI control is off by default. READ actions work whenever the server
     runs; ACT and PERSIST actions need the human to allow AI control
     (GUI checkbox, or --mcp-allow / headless mode).
+  * Driving the device's own user interface (device_input) needs a second,
+    separate permission, granted once per device connection ("Salli
+    tekoälyn ohjata laitteen käyttöliittymää"). It expires when the
+    connection changes or drops, when AI control is revoked, and on STOP.
+    The device menu can do everything, including DFU, saving a calibration
+    and switching the USB mode, so this is never implied by AI control.
   * STOP (GUI button or Esc in the AI panel) stops the sweep and revokes
-    AI control at once. The human has to allow it again.
+    AI control (and with it the UI-control permission) at once. The human
+    has to allow it again.
   * Every call is logged (memory + JSON lines file) so the human can see
     afterwards what the model did.
 """
@@ -77,7 +84,13 @@ class AIControl:
     def __init__(self, log_file: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._allowed = False
+        self._input_allowed = False
+        self._input_conn: object | None = None
         self._active_tool: str | None = None
+        # Identifies the current device connection (the VNA object while it
+        # is connected, else None); MCPSupport sets it. The UI-control
+        # permission is bound to it.
+        self.connection: Callable[[], object | None] = lambda: None
         self.entries: list[LogEntry] = []
         self.log_file = log_file
         # Called (from any thread) after state changes; the GUI panel
@@ -98,10 +111,65 @@ class AIControl:
         with self._lock:
             changed = allowed != self._allowed
             self._allowed = allowed
+        if not allowed:
+            self._revoke_input("AI-ohjaus otettu pois")
         if changed:
             logger.info("AI control %s by %s", "allowed" if allowed else
                         "revoked", by)
             self._notify()
+
+    # --- UI-control permission (device_input) -------------------------------
+
+    @property
+    def input_allowed(self) -> bool:
+        """Permission to drive the device's own user interface: valid only
+        for the connection it was granted on and only while AI control is
+        allowed. A stale permission is revoked (and logged) here."""
+        reason = None
+        with self._lock:
+            if not self._input_allowed:
+                return False
+            if not self._allowed:
+                reason = "AI-ohjaus ei ole sallittu"
+            elif (self._input_conn is None
+                  or self.connection() is not self._input_conn):
+                reason = "laiteyhteys vaihtui tai katkesi"
+        if reason is None:
+            return True
+        self._revoke_input(reason)
+        return False
+
+    def allow_input(self, allowed: bool, by: str = "user") -> bool:
+        """Grant (for the current connection) or revoke the UI-control
+        permission. Granting needs AI control allowed and a connected
+        device; returns whether the permission is valid afterwards."""
+        if not allowed:
+            self._revoke_input("käyttäjä peruutti luvan")
+            return False
+        conn = self.connection()
+        with self._lock:
+            if not self._allowed or conn is None:
+                return False
+            changed = not self._input_allowed or self._input_conn is not conn
+            self._input_allowed = True
+            self._input_conn = conn
+        if changed:
+            logger.info("UI control allowed by %s for this connection", by)
+            self.record(LogEntry(time.time(), "ui_control", "act", {}, "ok",
+                                 "Käyttöliittymän ohjaus sallittu tälle "
+                                 "laiteyhteydelle"))
+        return True
+
+    def _revoke_input(self, reason: str) -> None:
+        with self._lock:
+            was = self._input_allowed
+            self._input_allowed = False
+            self._input_conn = None
+        if was:
+            logger.info("UI control revoked: %s", reason)
+            self.record(LogEntry(time.time(), "ui_control", "act", {},
+                                 "stopped",
+                                 f"Käyttöliittymän ohjauslupa päättyi: {reason}"))
 
     def stop(self) -> None:
         """Human pressed STOP: revoke control. Sweep stop is done by GUI."""

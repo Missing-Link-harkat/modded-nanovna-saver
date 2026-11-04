@@ -106,6 +106,7 @@ class VirtualVNA(VNA):
         self._stop = 30_000_000
         self._file: Touchstone | None = None
         self._rng = np.random.default_rng(1)
+        self.shell_log: list[str] = []
         self.noise = 0.0005
         self.segment_delay = 0.05
         if SOURCE:
@@ -116,6 +117,25 @@ class VirtualVNA(VNA):
 
     def read_fw_version(self) -> Version:
         return Version.parse("1.0.0")
+
+    def exec_command(self, command: str, wait: float = 0.0):
+        """Simulated firmware text shell for tests (device_shell tools):
+        answers like the Missing Link firmware for a few commands."""
+        self.shell_log.append(command)
+        words = command.split()
+        if command == "version":
+            yield "Version 1.0.0"
+            yield "proto 1.0"
+        elif command == "info":
+            yield "Board: VIRTUAL (NanoVNA-H 4 compatible, virtual)"
+        elif command == "sweep-stats":
+            yield "sweeps: 0 late: 0"
+        elif command == "sweep" and len(words) == 1:
+            yield f"{self._start} {self._stop} 101"
+        elif words and words[0] == "bogus":
+            yield "?unknown command: bogus"
+        else:
+            yield f"ok: {command}"
 
     def init_features(self) -> None:
         self.features.add("Customizable data points")
