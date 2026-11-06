@@ -100,6 +100,12 @@ def main():
         help="Add a simulated VNA (optionally replaying a .s1p/.s2p file)",
     )
     parser.add_argument(
+        "--virtual-seed",
+        type=int,
+        metavar="N",
+        help="Simulated antenna and filter drawn from seed N",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"NanoVNASaver {VERSION}"
     )
     args = parser.parse_args()
@@ -107,7 +113,7 @@ def main():
     if args.headless:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     if args.virtual is not None:
-        VirtualVNA.enable(args.virtual or None)
+        VirtualVNA.enable(args.virtual or None, seed=args.virtual_seed)
 
     console_log_level = logging.WARNING
     file_log_level = logging.DEBUG
