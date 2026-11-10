@@ -211,7 +211,7 @@ class SaverMCP:
         published schema says additionalProperties: false.
         """
         # pylint: disable-next=protected-access
-        tool = self.server._tool_manager.get_tool(name)  # noqa: SLF001
+        tool = self.server._tool_manager.get_tool(name)
         meta = tool.fn_metadata
         base = meta.arg_model
         allowed = sorted(f.alias or n for n, f in base.model_fields.items())

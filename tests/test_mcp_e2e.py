@@ -5,6 +5,7 @@ server does); the test's main thread runs the Qt event loop.
 """
 
 import asyncio
+import base64
 import json
 import os
 import threading
@@ -17,6 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 mcp = pytest.importorskip("mcp")
 
 from PySide6 import QtWidgets  # noqa: E402
+from PySide6.QtGui import QImage  # noqa: E402
 
 from NanoVNASaver.Hardware import VirtualVNA  # noqa: E402
 from NanoVNASaver.MCP import MCPOptions  # noqa: E402
@@ -357,8 +359,6 @@ def test_persist_without_confirmation_channel(saver):
 def test_virtual_device_screenshot(saver):
     """VirtualVNA has a simulated 480x320 screen. The same range gives
     the same image (no noise), another range a different one."""
-    from PySide6.QtGui import QImage  # pylint: disable=import-outside-toplevel
-
     _, window, _ = saver
     window.mcp.control.allow(True)
     call(saver, "device_connect", {"port": "virtual"})
@@ -375,8 +375,6 @@ def test_virtual_device_screenshot(saver):
 
     first, again = shot(), shot()
     assert first == again
-    import base64  # pylint: disable=import-outside-toplevel
-
     image = QImage.fromData(base64.b64decode(first))
     assert (image.width(), image.height()) == (480, 320)
     yellow = sum(

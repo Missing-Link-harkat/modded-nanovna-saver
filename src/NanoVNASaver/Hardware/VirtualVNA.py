@@ -32,6 +32,7 @@ device_screenshot tool and UI tests can be developed without hardware.
 
 import logging
 import math
+from itertools import pairwise
 from dataclasses import dataclass
 from time import sleep
 
@@ -169,7 +170,7 @@ def render_screen(
             for i, f in enumerate(frac)
         ]
         p.setPen(QPen(QColor(255, 255, 0), 2))
-        for a, b in zip(pts, pts[1:]):
+        for a, b in pairwise(pts):
             p.drawLine(a, b)
         p.setPen(QColor(255, 255, 255))
         p.setFont(QFont("Sans", 9))
@@ -218,7 +219,7 @@ class VirtualVNA(VNA):
         s11, _ = self._values(freqs)
         return render_screen(self._start, self._stop, np.asarray(s11))
 
-    def getScreenshot(self) -> QPixmap:  # noqa: N802 (VNA API)
+    def getScreenshot(self) -> QPixmap:
         return QPixmap.fromImage(self.screen_image())
 
     def get_bandwidths(self) -> list[int]:
