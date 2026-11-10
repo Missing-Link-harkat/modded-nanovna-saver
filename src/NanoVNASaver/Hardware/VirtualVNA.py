@@ -32,8 +32,8 @@ device_screenshot tool and UI tests can be developed without hardware.
 
 import logging
 import math
-from itertools import pairwise
 from dataclasses import dataclass
+from itertools import pairwise
 from time import sleep
 
 import numpy as np
