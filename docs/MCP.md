@@ -50,7 +50,9 @@ Toinen vaihtoehto on tila B.
 
 Ikkunattomassa tilassa AI-ohjaus on sallittu, koska käyttäjä käynnisti Saverin
 nimenomaan mallia varten. Tiedostojen tallennus kysytään silloin asiakkaan kautta
-(elicitation). Jos asiakas ei tue kysymistä, tallennus estetään.
+(elicitation). Jos asiakas ei tue kysymistä, tallennus estetään, ja malli saa
+virheen "Kuittausta ei voitu pyytää…" (ei "käyttäjä ei hyväksynyt"), jotta se ei
+luule ihmisen kieltäytyneen.
 
 ### C. Ilman laitetta: virtuaalilaite
 
@@ -58,6 +60,11 @@ nimenomaan mallia varten. Tiedostojen tallennus kysytään silloin asiakkaan kau
 on 14,2 MHz (S11), ja 145 MHz:n kaistanpäästösuodatinta (S21). Kun valitsimelle antaa
 tiedoston (`--virtual mittaus.s2p`), virtuaalilaite toistaa sitä. Virtuaalilaitteella voi kehittää ja
 testata, vaikka oikea laite ei vielä tunnistu (#19).
+
+Virtuaalilaitteella on myös simuloitu 480 × 320 -näyttö, joten `device_screenshot` toimii
+ilman laitetta. Kuvassa on viimeisimmän pyyhkäisyn alueen S11-käyrä (0 … −40 dB) ilman
+kohinaa: sama alue antaa aina saman kuvan, joten testit voivat verrata sitä referenssiin.
+Kuva ei jäljittele LiteVNA64:n oikeaa käyttöliittymää.
 
 ```bash
 python -m NanoVNASaver --virtual --mcp http --mcp-allow
@@ -89,6 +96,10 @@ python -m NanoVNASaver --virtual --mcp http --mcp-allow
   origineista hylätään.
 - Kalibroinnissa malli ei voi ohittaa ihmistä: jokainen standardi kysytään erikseen
   ("kytke SHORT"), ja mittaus alkaa vasta kuittauksen jälkeen.
+- Työkalu hylkää parametrit, joita sillä ei ole ("Tuntematon parametri X. Työkalun Y
+  sallitut parametrit: …"), ja skeemoissa on `additionalProperties: false`. Ilman tätä
+  arvattu parametri (esim. `marker_add(freq_hz=…)`) ohitettaisiin hiljaa ja malli
+  luulisi sen toimineen.
 
 ## Mitä mallilla on käytössä
 

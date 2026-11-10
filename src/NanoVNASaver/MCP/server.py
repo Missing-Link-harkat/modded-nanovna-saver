@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .bridge import MainThreadBridge
 from .control import AIControl, LogEntry
@@ -199,6 +199,45 @@ class SaverMCP:
             ),
             structured_output=False,
         )
+        self._forbid_unknown_arguments(act.name)
+
+    def _forbid_unknown_arguments(self, name: str) -> None:
+        """Make the tool refuse arguments it does not have.
+
+        By default the framework's argument model ignores unknown keys,
+        so a model that guesses a parameter (marker_add(freq_hz=...))
+        gets "ok" and believes it was used. The argument model is read on
+        every call, so it is replaced here by a strict subclass, and the
+        published schema says additionalProperties: false.
+        """
+        # pylint: disable-next=protected-access
+        tool = self.server._tool_manager.get_tool(name)  # noqa: SLF001
+        meta = tool.fn_metadata
+        base = meta.arg_model
+        allowed = sorted(f.alias or n for n, f in base.model_fields.items())
+        allowed_set = frozenset(allowed)
+        allowed_text = ", ".join(allowed) if allowed else "ei parametreja"
+
+        class Strict(base):  # type: ignore[misc,valid-type]
+            model_config = ConfigDict(**base.model_config, extra="forbid")
+
+            @model_validator(mode="before")
+            @classmethod
+            def _no_unknown(cls, data: Any) -> Any:
+                if isinstance(data, dict):
+                    unknown = sorted(set(data) - allowed_set)
+                    if unknown:
+                        raise ValueError(
+                            f"Tuntematon parametri {', '.join(unknown)}. "
+                            f"Työkalun {name} sallitut parametrit: "
+                            f"{allowed_text}."
+                        )
+                return data
+
+        Strict.__name__ = base.__name__
+        Strict.__qualname__ = base.__qualname__
+        meta.arg_model = Strict
+        tool.parameters["additionalProperties"] = False
 
     def _resolver(self, act: Action) -> Any:
         """Resolver asking the client to confirm `act` (mcp >= 2)."""
@@ -228,6 +267,17 @@ class SaverMCP:
             **{p.name: p.annotation for p in params},
         }
         return resolve
+
+    def can_ask(self, ctx: Context | None, answer: Any = None) -> bool:
+        """Whether a human can be asked at all: the client was (or can
+        be) asked over elicitation, or Saver has its own dialog. Headless
+        with a client without elicitation has neither."""
+        if answer is not None:
+            if getattr(answer, "data", None) is not _ASK_IN_GUI:
+                return True
+        elif ctx is not None and _client_supports_elicitation(ctx):
+            return True
+        return self.gui_confirm is not None
 
     async def confirm(
         self, ctx: Context | None, message: str, answer: Any = None
@@ -291,6 +341,15 @@ class SaverMCP:
                 await lock.acquire()
             self.control.begin(act.name)
             if act.confirm is not None:
+                if not self.can_ask(ctx, confirmation):
+                    log("denied", "kuittausta ei voitu pyytää")
+                    raise Refused(
+                        "Kuittausta ei voitu pyytää: tämä asiakas ei tue "
+                        "kuittauspyyntöjä (elicitation), eikä Saverilla ole "
+                        "ikkunaa (headless). Toimintoa ei tehty, eikä "
+                        "kukaan kieltäytynyt. Tallennus vaatii Saverin "
+                        "ikkunatilan tai kuittauksia tukevan asiakkaan."
+                    )
                 if not await self.confirm(
                     ctx, act.confirm(**kwargs), confirmation
                 ):

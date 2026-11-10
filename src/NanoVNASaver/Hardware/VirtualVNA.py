@@ -25,6 +25,9 @@ frequencies. Enable with `--virtual [file]`; it then appears as port
 "virtual" in the port list. `--virtual-seed N` draws the antenna and
 filter from N instead (Params.from_seed), so an evaluation run cannot
 be answered from memory of the default values.
+
+It also has a simulated 480x320 device screen (getScreenshot), so the
+device_screenshot tool and UI tests can be developed without hardware.
 """
 
 import logging
@@ -33,6 +36,8 @@ from dataclasses import dataclass
 from time import sleep
 
 import numpy as np
+from PySide6.QtCore import QPointF
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 
 from ..Touchstone import Touchstone
 from ..utils.version import Version
@@ -133,6 +138,51 @@ def model(
     return s11, s21
 
 
+SCREEN_W, SCREEN_H = 480, 320  # LiteVNA64 display
+SCREEN_DB_TOP, SCREEN_DB_BOTTOM = 0.0, -40.0  # S11 log-mag scale
+_PLOT = (40, 24, 440, 272)  # x, y, w, h of the trace area
+
+
+def render_screen(
+    start: int, stop: int, s11: np.ndarray, title: str = "VirtualVNA"
+) -> QImage:
+    """The simulated device screen: header, 10 x 8 grid, the S11 log-mag
+    trace of `s11` (evenly spaced over start..stop) and the range.
+    Deterministic for the same input, so tests can compare pixels."""
+    img = QImage(SCREEN_W, SCREEN_H, QImage.Format.Format_RGB32)
+    img.fill(QColor(0, 0, 0))
+    x0, y0, w, h = _PLOT
+    p = QPainter(img)
+    try:
+        p.setPen(QPen(QColor(64, 64, 64), 1))
+        for i in range(11):
+            x = x0 + w * i / 10
+            p.drawLine(QPointF(x, y0), QPointF(x, y0 + h))
+        for i in range(9):
+            y = y0 + h * i / 8
+            p.drawLine(QPointF(x0, y), QPointF(x0 + w, y))
+        db = 20 * np.log10(np.maximum(np.abs(s11), 1e-6))
+        span = SCREEN_DB_TOP - SCREEN_DB_BOTTOM
+        frac = np.clip((SCREEN_DB_TOP - db) / span, 0.0, 1.0)
+        pts = [
+            QPointF(x0 + w * i / max(len(db) - 1, 1), y0 + h * f)
+            for i, f in enumerate(frac)
+        ]
+        p.setPen(QPen(QColor(255, 255, 0), 2))
+        for a, b in zip(pts, pts[1:]):
+            p.drawLine(a, b)
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(QFont("Sans", 9))
+        p.drawText(4, 16, f"{title}  S11 LOGMAG 5dB/")
+        p.drawText(
+            4, SCREEN_H - 8,
+            f"START {start / 1e6:.3f} MHz   STOP {stop / 1e6:.3f} MHz",
+        )
+    finally:
+        p.end()
+    return img
+
+
 class VirtualVNA(VNA):
     name = "VirtualVNA"
     valid_datapoints = (101, 201, 401, 51, 11)
@@ -160,6 +210,16 @@ class VirtualVNA(VNA):
 
     def init_features(self) -> None:
         self.features.add("Customizable data points")
+        self.features.add("Screenshots")
+
+    def screen_image(self) -> QImage:
+        """The simulated screen for the current range, without noise."""
+        freqs = self._freqs()
+        s11, _ = self._values(freqs)
+        return render_screen(self._start, self._stop, np.asarray(s11))
+
+    def getScreenshot(self) -> QPixmap:  # noqa: N802 (VNA API)
+        return QPixmap.fromImage(self.screen_image())
 
     def get_bandwidths(self) -> list[int]:
         return [1000]
