@@ -31,6 +31,7 @@ import bisect
 import cmath
 import logging
 import math
+import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,8 @@ from ..RFTools import Datapoint
 from ..Settings.Sweep import SweepMode
 from ..Touchstone import Touchstone
 from .bridge import Pending
+from . import shell_allowlist
+from .device_watch import MAX_WAIT_S, DeviceWatch
 from .registry import Risk, action
 
 if TYPE_CHECKING:
@@ -84,6 +87,19 @@ def _confirm_standard(standard: str, **_: Any) -> str:
         f"Kalibrointi: kytke {text}. Kuittaa kun standardi on kytketty, "
         "niin pyyhkäisy mitataan."
     )
+
+
+def _confirm_shell(command: str, **_: Any) -> str:
+    # Check before asking: a refused command (never-list, wrong class,
+    # unlisted) must fail at once, not be shown to the user for approval.
+    try:
+        shell_allowlist.check(command, Risk.PERSIST)
+    except shell_allowlist.ShellRefused as exc:
+        raise ActionError(str(exc)) from exc
+    return shell_allowlist.confirm_text(command)
+
+
+MAX_SHELL_OUTPUT = 4000
 
 
 def _round(value: float, digits: int = 4) -> float | None:
@@ -245,6 +261,8 @@ class SaverAPI:
 
         # Instance attribute shadows the method for every caller.
         app.showError = show_error  # type: ignore[method-assign]
+        # follows the device across resets and mode changes (#190)
+        self.watch = DeviceWatch(app)
 
     # --- helpers ---------------------------------------------------------
 
@@ -391,7 +409,8 @@ class SaverAPI:
                 fut.set_result(True)
 
         signals.finished.connect(done)
-        sc.connect_device()
+        self.last_error = ""
+        sc.connect_device(purpose="NanoVNA-Saver MCP (device_connect)")
         if not self.app.vna.connected():
             signals.finished.disconnect(done)
             raise ActionError(
@@ -430,8 +449,9 @@ class SaverAPI:
         IF bandwidth, frequency limits and serial number."""
         vna = self.app.vna
         if not vna.connected():
-            return {"connected": False}
+            return {"connected": False, "usb": self.watch.snapshot()}
         return {
+            "usb": self.watch.snapshot(),
             "connected": True,
             "name": vna.name,
             "firmware": str(vna.version),
@@ -444,6 +464,162 @@ class SaverAPI:
             "max_freq_hz": vna.sweep_max_freq_hz,
             "port": str(vna.serial.port),
         }
+
+    def _our_firmware(self) -> bool:
+        """True for the Missing Link firmware: `version` reports proto 1.x.
+        Asked once per connection."""
+        vna = self.app.vna
+        cached = getattr(vna, "_mcp_our_firmware", None)
+        if cached is None:
+            try:
+                lines = list(vna.exec_command("version"))
+            except Exception:  # serial trouble: not provably ours
+                return False
+            cached = any(
+                ln.lower().startswith("proto 1.") for ln in lines
+            )
+            vna._mcp_our_firmware = cached  # pylint: disable=protected-access
+        return cached
+
+    def _shell(self, command: str, risk: Risk) -> dict:
+        try:
+            cmd = shell_allowlist.check(command, risk)
+        except shell_allowlist.ShellRefused as exc:
+            raise ActionError(str(exc)) from exc
+        return self._send(cmd)
+
+    def _send(self, cmd: str) -> dict:
+        """Send one already validated command to the firmware shell."""
+        self._require_device()
+        self._require_idle()
+        if not self._our_firmware():
+            raise ActionError(
+                "device_shell toimii vain Missing Linkin laiteohjelmistolla "
+                "(version-vastauksessa 'proto 1.x'). Tämä laite ei ole sellainen."
+            )
+        started = time.monotonic()
+        try:
+            lines = list(self.app.vna.exec_command(cmd))
+        except OSError as exc:
+            raise ActionError(
+                f"Laite ei vastannut komentoon '{cmd}' ajoissa: {exc}"
+            ) from exc
+        output = "\n".join(lines)
+        truncated = len(output) > MAX_SHELL_OUTPUT
+        return {
+            "command": cmd,
+            "output": output[:MAX_SHELL_OUTPUT],
+            "truncated": truncated,
+            "error": any(ln.startswith("?") for ln in lines),
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+
+    @action(
+        "device_shell",
+        risk=Risk.READ,
+        category="device",
+        gui=("MCP only: no Saver control (firmware diagnostics)",),
+        timeout=60.0,
+    )
+    def device_shell(self, command: str) -> dict:
+        """Run one READ-only diagnostic command of the device firmware
+        (e.g. "version", "info", "sweep-stats", "sd stats", "cal why",
+        "msc log", "usb status", "sweep") and return {command, output,
+        truncated, error, ms}. Only commands on a fixed allowlist work;
+        anything else is refused. Needs the Missing Link firmware and no
+        running sweep. Commands that change state are in device_shell_act
+        and device_shell_persist."""
+        return self._shell(command, Risk.READ)
+
+    @action(
+        "device_shell_act",
+        risk=Risk.ACT,
+        category="device",
+        gui=("MCP only: no Saver control (firmware commands)",),
+        timeout=60.0,
+    )
+    def device_shell_act(self, command: str) -> dict:
+        """Run one allowlisted firmware command that changes the running
+        session only (lost at reset): "sweep <start> <stop> [points]",
+        "sweep-avg <1-16>", "sweep-settle <us>", "ref on|off", "s21
+        on|off|norm", "power [lo] <0-3>", "cal off", "recall <0-4>".
+        Button, touch and wheel events are NOT here: use device_input.
+        Returns {command, output, truncated, error, ms}. Needs AI control
+        allowed, the Missing Link firmware and no running sweep."""
+        return self._shell(command, Risk.ACT)
+
+    @action(
+        "device_input",
+        risk=Risk.ACT,
+        category="device",
+        gui=("MCP only: no Saver control (the device's own user interface)",),
+        timeout=30.0,
+        ui_permission=True,
+    )
+    def device_input(self, command: str) -> dict:
+        """Send ONE input event to the device's own user interface:
+        "input key <hex> <hex> up|down" (HID usage and modifiers, e.g.
+        "input key 28 00 down" then "... up" is SELECT, 4f = RIGHT, 50 =
+        LEFT), "input ptr <x> <y> down|up|move" (touch, screen 480x320),
+        "input wheel <n>". WARNING: the device menu can do everything the
+        buttons can, including DFU mode, saving a calibration and
+        switching the USB mode; Storage removes the device's COM port, so
+        Saver loses the device and only a human at the device can bring
+        it back. Needs AI control allowed AND the separate UI-control
+        permission the user grants for this device connection (it ends
+        when the connection changes or STOP is pressed). Returns
+        {command, output, truncated, error, ms}."""
+        try:
+            cmd = shell_allowlist.check_input(command)
+        except shell_allowlist.ShellRefused as exc:
+            raise ActionError(str(exc)) from exc
+        return self._send(cmd)
+
+    @action(
+        "device_shell_persist",
+        risk=Risk.PERSIST,
+        category="device",
+        gui=("MCP only: no Saver control (firmware commands)",),
+        confirm=_confirm_shell,
+        timeout=60.0,
+    )
+    def device_shell_persist(self, command: str) -> dict:
+        """Run one allowlisted firmware command that writes to the device
+        flash or SD card: "save <0-4>" (overwrites a calibration slot),
+        "meas save" (.s1p to the SD card), "meas antenna|test|operator|note
+        <text>". The user confirms every call. Returns {command, output,
+        truncated, error, ms}."""
+        return self._shell(command, Risk.PERSIST)
+
+    @action(
+        "device_wait",
+        risk=Risk.READ,
+        category="device",
+        gui=("Serial port control: Connect to device (by hand after a reset)",),
+        timeout=MAX_WAIT_S + 30,
+    )
+    def device_wait(
+        self,
+        state: Literal[
+            "app", "loader", "vendor_bl", "storage", "rom_dfu", "gone"
+        ] = "app",
+        timeout_s: float = 60,
+        expect_change: bool = False,
+    ) -> Pending:
+        """Wait until the LiteVNA is in `state` and return the state seen.
+
+        States (seen from USB): app = firmware running (serial port),
+        vendor_bl = dark-screen update mode, storage = USB Storage mode (no
+        serial port), rom_dfu = chip ROM DFU, loader = boot menu (not on
+        USB yet), gone = not on USB. Use after anything that restarts the
+        device: Saver reconnects by itself when the device is back in
+        app, and "app" returns only when it is connected again and idle,
+        so sweep_run works right after. Right after a command that
+        restarts the device (reset, flash) pass expect_change=true: the
+        device is still up for a moment, and the wait must first see it
+        leave. timeout_s max 300. On timeout the result has "timeout":
+        true and the state that was seen."""
+        return Pending(self.watch.wait(state, timeout_s, expect_change))
 
     @action(
         "device_set_datapoints",

@@ -70,6 +70,58 @@ Kuva ei jäljittele LiteVNA64:n oikeaa käyttöliittymää.
 python -m NanoVNASaver --virtual --mcp http --mcp-allow
 ```
 
+### D. Etäkone SSH:n yli
+
+Laite on kytketty toiseen koneeseen (esim. testikone, litevna-openvna#156). Malli ajetaan
+omalla koneella. Saver asennetaan etäkoneelle käyttäjän omaan venviin
+(`~/venv/bin/pip install -e ".[mcp]"`), ja kirjautumisen pitää toimia SSH-avaimella ilman
+salasanaa.
+
+**Ensisijainen tapa: stdio SSH:n yli.** Asiakas käynnistää Saverin etäkoneelle ssh:lla:
+
+```bash
+claude mcp add litevna-testikone -- ssh -T -o BatchMode=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  <käyttäjä>@<etäkone> ~/venv/bin/python -m NanoVNASaver --headless --mcp stdio
+```
+
+- `-T`: ei päätettä. Pääte sekoittaisi rivinvaihdot ja protokollan.
+- `BatchMode=yes`: jos avain puuttuu, yhteys epäonnistuu heti eikä jää odottamaan salasanaa.
+- `ServerAliveInterval`: jos verkko katkeaa, asiakas huomaa sen noin 45 sekunnissa.
+- `--headless` asettaa Qt:n offscreen-tilaan, joten etäkoneella ei tarvita näyttöä.
+
+stdoutiin menee vain JSON-RPC. Saver siirtää kaiken muun tulosteen stderriin heti
+käynnistyksen alussa (`MCP/stdio_wire.py`). Tähän kuuluvat print-lauseet sekä Qt:n ja
+C-kirjastojen viestit. Claude Code näyttää stderrin MCP-lokissa. Debug-lokin saa valitsimella
+`--debug-file`.
+
+Kun yhteys katkeaa, Saver vapauttaa laitteen ja sammuu itse. Tämä tapahtuu, kun stdin
+sulkeutuu (ssh päättyy) tai prosessi saa SIGTERMin tai SIGHUPin: pyyhkäisy pysäytetään,
+sarjaportti suljetaan ja paluukoodi on 0. Testi: `tests/test_mcp_stdio.py`.
+Jos verkko katkeaa niin, ettei etäkone huomaa sitä, sshd pitää Saverin käynnissä TCP:n
+aikakatkaisuun asti. Etäkoneen `/etc/ssh/sshd_config`:iin kannattaa siksi lisätä
+`ClientAliveInterval 15` ja `ClientAliveCountMax 3`. Laitelukko (litevna-openvna#188,
+Saver PR #14) on `flock`, joten se vapautuu aina, kun prosessi päättyy, myös `kill -9`:llä.
+
+Tallennetut tiedostot jäävät etäkoneen työhakemistoon (`~/NanoVNASaver-MCP`).
+Kuvakaappaukset ja kaaviot tulevat vastauksen mukana.
+
+**Vaihtoehto: HTTP ja SSH-tunneli.** Tätä tapaa kannattaa käyttää, kun Saver jää etäkoneelle
+käyntiin usean asiakasyhteyden ajaksi.
+
+```bash
+# etäkoneella (esim. tmuxissa)
+~/venv/bin/python -m NanoVNASaver --headless --mcp http
+# omalla koneella: tunneli ja tunniste
+ssh -N -L 8765:127.0.0.1:8765 <käyttäjä>@<etäkone> &
+ssh <käyttäjä>@<etäkone> cat .nanovna-saver/mcp.json
+claude mcp add --transport http litevna-testikone http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+HTTP kuuntelee etäkoneella vain osoitteessa 127.0.0.1, joten siihen pääsee vain tunnelin
+kautta, ja tunniste tarvitaan silti. Tunniste vaihtuu joka käynnistyksellä.
+
 ## Turvallisuus
 
 | AI ohjaa | STOP painettu |
@@ -96,6 +148,13 @@ python -m NanoVNASaver --virtual --mcp http --mcp-allow
   origineista hylätään.
 - Kalibroinnissa malli ei voi ohittaa ihmistä: jokainen standardi kysytään erikseen
   ("kytke SHORT"), ja mittaus alkaa vasta kuittauksen jälkeen.
+- **Laitelukko.** Kun Saver kytkeytyy oikeaan laitteeseen (GUI:n Connect tai `device_connect`), se ottaa
+  saman koneenlaajuisen lukon kuin litevna-openvna:n `tools/vna_lock.py` ja vapauttaa sen, kun yhteys
+  katkaistaan. Jos lukko on varattu, kytkentä hylätään ja viestissä näkyy pitäjä ja tarkoitus
+  (esim. `lfai@marko pid 1234, 40 s, tarkoitus: savutesti`). Rescan ei avaa portteja, kun joku muu pitää
+  lukkoa: laite näkyy listassa merkinnällä "(varattu)". Virtuaalilaite ei ota lukkoa. Lukon muoto
+  (polku, `flock`/`msvcrt`, `.holder`-tiedosto, `LITEVNA_LOCK_HELD`) on kuvattu tiedostossa
+  `src/NanoVNASaver/device_lock.py`, ja sen määrää `vna_lock.py`.
 - Työkalu hylkää parametrit, joita sillä ei ole ("Tuntematon parametri X. Työkalun Y
   sallitut parametrit: …"), ja skeemoissa on `additionalProperties: false`. Ilman tätä
   arvattu parametri (esim. `marker_add(freq_hz=…)`) ohitettaisiin hiljaa ja malli
@@ -103,11 +162,55 @@ python -m NanoVNASaver --virtual --mcp http --mcp-allow
 
 ## Mitä mallilla on käytössä
 
-**Työkalut** (41) generoidaan toimintorekisteristä (`src/NanoVNASaver/MCP/api.py`, `@action`).
+**Työkalut** (46) generoidaan toimintorekisteristä (`src/NanoVNASaver/MCP/api.py`, `@action`).
 Ryhmät:
 
 - **device**: `device_list_ports`, `device_connect`, `device_disconnect`, `device_info`,
-  `device_set_datapoints`, `device_set_bandwidth`, `device_set_validation`, `device_screenshot`
+  `device_wait`, `device_set_datapoints`, `device_set_bandwidth`, `device_set_validation`,
+  `device_screenshot`, `device_shell`, `device_shell_act`, `device_shell_persist`,
+  `device_input` (ks. alla)
+
+**Laitteen seuranta (litevna-openvna#190).** Kun LiteVNA on kytketty, Saver seuraa sen
+USB-porttipolkua (esim. `1-1`) puolen sekunnin välein (`MCP/device_watch.py`,
+`Hardware/usb_state.py`). Laite tunnistetaan porttipolusta, ei portin nimestä, koska
+sovelluksella, valmistajan bootloaderilla ja Storage-tilalla on sama VID:PID `04b4:0008` ja
+sarjanumero `ZN406001` on kaikissa yksilöissä sama.
+
+| tila | miltä näyttää USB:ssä |
+|---|---|
+| `app` | `04b4:0008` ja CDC-sarjaportti |
+| `vendor_bl` | `04b4:0008`, tuote "CDC-ACM Demo" (tumma näyttö, päivitystila) |
+| `storage` | `04b4:0008`, pelkkä massamuisti, ei sarjaporttia |
+| `rom_dfu` | `2e3c:df11` (BOOT0) |
+| `loader` | varattu: loaderilla ei vielä ole USB:tä (#184) |
+| `gone` | ei mitään siinä portissa |
+
+- Kun laite poistuu sovellustilasta (reset, päivitystila, Storage, irrotus), kesken oleva
+  pyyhkäisy epäonnistuu heti ja virheessä kerrotaan havaittu tila. Sarjaportti suljetaan,
+  ja asiakkaille lähetetään `saver://device`-päivitysilmoitus ja lokiviesti.
+- Kun sama porttipolku näyttää taas sovelluksen, Saver yhdistää itse, vaikka portin nimi
+  olisi vaihtunut. Jos käyttäjä irrottaa yhteyden itse (painike tai `device_disconnect`),
+  seuranta loppuu.
+  - Saver yhdistää vasta, kun portti on ollut näkyvissä 1,5 s ja tunnistus antaa saman
+    laitetyypin kuin ensimmäisellä kerralla (esim. H4). Oikealla laitteella CDC-portti tulee
+    näkyviin ennen kuin komentotulkki vastaa. Silloin tunnistus antaa "Unknown", ja kaikki
+    pyyhkäisyt epäonnistuvat.
+  - Linuxin USB-laitenumero vaihtuu jokaisessa enumeroinnissa. Siksi myös nopea
+    uudelleenkäynnistys, joka ehtii valmiiksi kahden tarkistuksen välissä, havaitaan.
+- `device_wait(state, timeout_s, expect_change)` odottaa haluttua tilaa. `app` palaa vasta,
+  kun laite on taas kytketty ja vapaa, joten `sweep_run` toimii heti sen jälkeen. Jos
+  Saver ei ole vielä yhdistänyt laitteeseen, `app` tarkoittaa pelkkää USB-tilaa.
+  `device_info` kertoo USB-tilan kentässä `usb`.
+- `expect_change=true` heti uudelleenkäynnistävän komennon (reset, flashaus) jälkeen:
+  laite pysyy USB:ssä vielä hetken (oikealla laitteella 0,05–1,9 s), joten odotuksen täytyy
+  ensin nähdä sen poistuvan. Ilman tätä `app` palasi heti 0,0 sekunnissa.
+- Oikea laite 11.11. (main `d521d9e`): `reset` → `device_wait("app", expect_change=true)` →
+  `sweep_run` onnistui 10/10, noin 21,5 s kierros. Storage-kulku 4/4: Storage
+  tunnistetaan, kytketyn laitteen katoaminen havaitaan 9,2 s:ssa, ja Control-tilaan
+  palattua Saver yhdistää uudelleen ja mittaa.
+- Linuxilla tila luetaan `/sys/bus/usb/devices`-hakemistosta, josta näkyvät kaikki tilat.
+  Muilla käyttöjärjestelmillä näkyvät vain sarjaportit, joten `storage` ja `rom_dfu`
+  näkyvät tilana `gone`.
 - **sweep**: `sweep_get`, `sweep_configure`, `band_list`, `sweep_set_band`,
   `sweep_set_attenuator`, `sweep_run`, `sweep_stop`, `sweep_segmented`
 - **data**: `data_summary`, `data_points`, `data_at` (arvo yhdellä taajuudella, interpoloitu mitattujen pisteiden välillä; virhe, jos taajuus on pyyhkäisyn ulkopuolella), `reference_set`, `reference_reset`
@@ -141,6 +244,59 @@ Täysi data on saatavilla **resursseina**, jotta mallin konteksti ei täyty tuha
 
 **Promptit** ovat valmiita mittausreseptejä: `antenna(start_hz, stop_hz)`,
 `filter(start_hz, stop_hz)`, `cable_length`, `compare`.
+
+### Laitteen komentorivi: `device_shell*`
+
+Saver varaa sarjaportin, joten malli ei pääse laiteohjelmiston omiin diagnostiikkakomentoihin
+muuten. Kolme työkalua lähettää **yhden sallitun komennon** jo avattuun porttiin Saverin
+sarjaporttilukon alla. Vapaata komentoriviä ei ole: komennon pitää täsmätä sallittujen listaan
+(`src/NanoVNASaver/MCP/shell_allowlist.py`, jokaisella rivillä on perustelu). Listaamaton komento
+hylätään, samoin `;`, `|`, `&`, rivinvaihdot ja muut erikoismerkit.
+
+| työkalu | riski | esimerkkejä |
+|---|---|---|
+| `device_shell` | read | `version`, `info`, `sweep-stats`, `sd stats`, `cal why`, `msc log`, `usb status`, `sweep`, `power` |
+| `device_shell_act` | act (AI-ohjaus sallittu) | `sweep 50000000 1500000000 201`, `sweep-avg 4`, `ref on`, `s21 on`, `s21 norm`, `power 2`, `cal off`, `recall 1` |
+| `device_shell_persist` | persist (käyttäjä kuittaa joka kerta) | `save 2` (ylikirjoittaa kalibrointislotin), `meas save`, `meas note <teksti>` |
+
+- Työkalu hylkää komennon, jos se kuuluu toiseen luokkaan, ja kertoo oikean työkalun nimen.
+- Toimii vain Missing Linkin laiteohjelmistolla (`version` vastaa `proto 1.x`), ei käynnissä olevan pyyhkäisyn aikana.
+- Aina kielletty (`NEVER_RULES`, tarkistetaan ennen sallittujen listaa, oma virheviesti syineen): `reset` kaikkine
+  muotoineen (`reset dfu`, `reset update`), `config-reset`, `usb mode …`, `dfu`, `bootloader`. Nämä jättävät laitteen
+  tilaan, josta pääsee pois vain laitteen ääressä (litevna-openvna#186, #176). Turvalliset etäversiot tulevat
+  issueista #175 (USB-tila ajastimella) ja #179 (`reset loader`).
+- Ei listalla, joten hylätään: `sd read`, rekisteri- ja pinnikomennot, `clk-set`
+  (omistaja päättää, kuuluuko se listaan) ja kalibrointistandardien `cal open|short|load`
+  (käytä `calibration_capture`, joka pyytää ihmistä kytkemään standardin).
+- Vastaus: `{command, output, truncated, error, ms}`; `error` on tosi, jos laite vastasi `?`-rivillä.
+- `cal on` ei ole listalla: laiteohjelmisto asettaa lipun tarkistamatta, että voimassa oleva kalibrointi on olemassa
+  (litevna-openvna#144). `cal off` ja `recall <0-4>` riittävät.
+- Painike-, kosketus- ja rulla-tapahtumat (`input key|ptr|wheel`) eivät ole `device_shell`-komentoja. Ne lähetetään
+  erillisellä työkalulla `device_input` (ks. alla).
+
+### Laitteen käyttöliittymän ohjaus: `device_input`
+
+`device_input` lähettää **yhden syötetapahtuman** laitteen omalle käyttöliittymälle: `input key <hex> <hex> up|down`
+(HID-käyttökoodi ja muokkaimet; `input key 28 00 down` ja `... up` on SELECT, `4f` = oikea, `50` = vasen),
+`input ptr <x> <y> down|up|move` (kosketus, näyttö 480x320) ja `input wheel <n>`. Muut komennot hylätään.
+
+**Tärkeää: käyttöliittymän kautta pääsee kaikkeen, mitä laitteen valikko tekee.** Siihen kuuluvat myös asiat,
+jotka `device_shell`-lista sulkee pois: DFU-tilaan siirtyminen (bootloader), kalibroinnin tallennus flashiin ja
+USB-tilan vaihto. **Storage-tila poistaa laitteen COM-portin**, jolloin Saver menettää laitteen eikä malli pääse
+takaisin: paluu vaatii ihmisen laitteen valikossa (USB → Control).
+
+Siksi `device_input` vaatii kaksi lupaa:
+
+1. **AI-ohjaus sallittu** (kuten muutkin ACT-toiminnot).
+2. **Erillinen lupa "Salli tekoälyn ohjata laitteen käyttöliittymää"**, jonka käyttäjä antaa Saverin AI (MCP) -paneelista
+   **kerran per laiteyhteys**. Lupa ei seuraa AI-ohjauksesta. Se raukeaa, kun yhteys katkeaa tai laite kytketään uudelleen,
+   kun AI-ohjaus otetaan pois ja kun käyttäjä painaa STOP. Sitä ei voi antaa ilman AI-ohjausta tai kytkettyä laitetta.
+   Headless-tilassa lupaa ei anneta automaattisesti: `--mcp-allow` koskee vain AI-ohjausta.
+
+Kun lupa on voimassa, paneelissa näkyy koko ajan punainen teksti "LAITTEEN KÄYTTÖLIITTYMÄN OHJAUS PÄÄLLÄ". Ilman lupaa
+`device_input` hylätään (loki: `denied`) eikä laitteelle lähetetä mitään. Jokainen syötetapahtuma kirjataan AI-lokiin kuten
+muutkin toiminnot, ja luvan antaminen ja raukeaminen kirjataan riveillä `ui_control`.
+
 
 ## Kehittäjälle
 

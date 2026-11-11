@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING
 from PySide6 import QtWidgets
 from PySide6.QtCore import Signal
 
+from ..device_lock import DEVICE_LOCK, LockBusy
 from ..Hardware.Hardware import Interface, get_interfaces, get_VNA
+from ..Hardware.VirtualVNA import VirtualInterface
 from .Control import Control
 
 if TYPE_CHECKING:
@@ -90,11 +92,20 @@ class SerialControl(Control):
         else:
             self.disconnect_device()
 
-    def connect_device(self):
+    def connect_device(self, purpose: str = "NanoVNA-Saver"):
         with self.interface.lock:
             new_interface = self.inp_port.currentData()
             if not new_interface:
                 return
+            # Same machine-wide lock as litevna-openvna tools/vna_lock.py
+            # (#188); the virtual device needs none.
+            if not isinstance(new_interface, VirtualInterface):
+                try:
+                    DEVICE_LOCK.acquire(purpose)
+                except LockBusy as exc:
+                    logger.error("%s", exc)
+                    self.app.showError(str(exc))
+                    return
             self.interface = new_interface
             logger.info("Connection %s", self.interface)
             try:
@@ -103,9 +114,11 @@ class SerialControl(Control):
                 logger.error(
                     "Tried to open %s and failed: %s", self.interface, exc
                 )
+                DEVICE_LOCK.release()
                 return
             if not self.interface.isOpen():
                 logger.error("Unable to open port %s", self.interface)
+                DEVICE_LOCK.release()
                 return
             self.interface.timeout = 0.05
         sleep(0.1)
@@ -162,6 +175,7 @@ class SerialControl(Control):
                 logger.error("Unable to disconnect from VNA: %s", exc)
 
             self.interface.close()
+            DEVICE_LOCK.release()
             self.btn_toggle.setText("Connect to device")
             self.btn_toggle.repaint()
 

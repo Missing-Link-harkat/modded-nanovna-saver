@@ -690,6 +690,17 @@ class NanoVNASaver(QWidget):
         new_chart.popout_requested.connect(self.popoutChart)
         return new_chart
 
+    def shutdown(self) -> None:
+        """Headless exit (stdio closed, SIGTERM/SIGHUP): stop the sweep
+        and release the serial port. Unlike closeEvent this does not store
+        window or GUI settings (the hidden window has no real geometry)."""
+        if self.mcp.service is not None:
+            self.mcp.service.stop_http()
+        self.worker.quit()
+        self.worker.wait(WORKING_KILL_TIME_MS)
+        self.threadpool.waitForDone(2500)
+        self.serial_control.disconnect_device()
+
     def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
         if self.mcp.service is not None:
             self.mcp.service.stop_http()

@@ -70,6 +70,23 @@ class MCPPanel(QtWidgets.QGroupBox):
         self.check_allow.toggled.connect(
             lambda on: self.control.allow(on, by="user")
         )
+        self.check_input = QtWidgets.QCheckBox(
+            "Salli tekoälyn ohjata laitteen käyttöliittymää"
+        )
+        self.check_input.setToolTip(
+            "Erillinen lupa, voimassa vain tälle laiteyhteydelle. Laitteen "
+            "valikko voi tehdä kaiken: DFU-tila, kalibroinnin tallennus ja "
+            "USB-tilan vaihto (Storage poistaa laitteen COM-portin, ja paluu "
+            "vaatii ihmisen laitteella). Raukeaa yhteyden katketessa ja "
+            "STOPilla."
+        )
+        self.check_input.toggled.connect(self.toggle_input)
+        self.label_input = QtWidgets.QLabel()
+        self.label_input.setWordWrap(True)
+        self.label_input.setStyleSheet(
+            "QLabel { color: white; background: #b00020; font-weight: bold;"
+            " padding: 2px; }"
+        )
         self.btn_stop = QtWidgets.QPushButton("STOP")
         self.btn_stop.setMinimumHeight(20)
         self.btn_stop.setStyleSheet(
@@ -77,13 +94,16 @@ class MCPPanel(QtWidgets.QGroupBox):
             " font-weight: bold; }"
         )
         self.btn_stop.setToolTip(
-            "Pysäyttää pyyhkäisyn ja ottaa AI-ohjauksen pois"
+            "Pysäyttää pyyhkäisyn ja ottaa AI-ohjauksen ja laitteen "
+            "käyttöliittymän ohjausluvan pois"
         )
         self.btn_stop.clicked.connect(self.stop)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.check_allow, stretch=1)
         row.addWidget(self.btn_stop, stretch=0)
         layout.addRow(row)
+        layout.addRow(self.check_input)
+        layout.addRow(self.label_input)
 
         self.label_status = QtWidgets.QLabel()
         self.label_status.setWordWrap(True)
@@ -128,6 +148,17 @@ class MCPPanel(QtWidgets.QGroupBox):
             f'"Authorization: Bearer {self.service.token}"'
         )
 
+    def toggle_input(self, on: bool) -> None:
+        ok = self.control.allow_input(on, by="user")
+        if on and not ok:
+            QtWidgets.QMessageBox.information(
+                self,
+                "AI (MCP)",
+                "Salli ensin AI-ohjaus ja kytke laite. Käyttöliittymän "
+                "ohjauslupa koskee vain nykyistä laiteyhteyttä.",
+            )
+        self.refresh()
+
     def stop(self) -> None:
         self.app.worker.quit()
         custom = self.app.windows.get("custom_sweep")
@@ -144,6 +175,19 @@ class MCPPanel(QtWidgets.QGroupBox):
         self.check_allow.blockSignals(True)
         self.check_allow.setChecked(self.control.allowed)
         self.check_allow.blockSignals(False)
+        input_on = self.control.input_allowed
+        self.check_input.blockSignals(True)
+        self.check_input.setChecked(input_on)
+        self.check_input.blockSignals(False)
+        self.check_input.setEnabled(
+            self.control.allowed and self.control.connection() is not None
+        )
+        self.label_input.setVisible(input_on)
+        self.label_input.setText(
+            "LAITTEEN KÄYTTÖLIITTYMÄN OHJAUS PÄÄLLÄ: tekoäly voi painaa "
+            "laitteen painikkeita ja koskettaa sen näyttöä (vain tälle "
+            "yhteydelle; STOP ottaa pois)"
+        )
         if self.control.active_tool:
             status = f"<b>AI ohjaa:</b> {self.control.active_tool}"
             self.setStyleSheet("QGroupBox { color: #b00020; }")

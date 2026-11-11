@@ -42,6 +42,7 @@ from .TinySA import TinySA, TinySA_Ultra
 from .VirtualVNA import VirtualVNA
 from .VNA import VNA
 from . import VirtualVNA as virtual
+from ..device_lock import DEVICE_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +121,14 @@ def get_interfaces() -> list[Interface]:
         )
         iface = Interface("serial", typename)
         iface.port = d.device
-        iface.open()
-        iface.comment = get_comment(iface)
-        iface.close()
+        if DEVICE_LOCK.busy_by_other():
+            # A remote run (tools/vna_lock.py) holds the device: probing
+            # the port would talk into its measurement (litevna-openvna#188)
+            iface.comment = f"{typename} (varattu)"
+        else:
+            iface.open()
+            iface.comment = get_comment(iface)
+            iface.close()
         interfaces.append(iface)
 
     if virtual.ENABLED:

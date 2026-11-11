@@ -64,6 +64,11 @@ class MCPSupport:
         self.app = app
         self.options = options
         self.control = AIControl(LOG_FILE)
+        # UI-control permission is bound to the current device connection:
+        # the VNA object while it is connected (a new connect makes a new one).
+        self.control.connection = lambda: (
+            app.vna if app.vna.connected() else None
+        )
         self.service: "SaverMCP | None" = None
         self.panel: QtWidgets.QWidget | None = None
 

@@ -28,15 +28,17 @@ resulting data.
 import argparse
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from NanoVNASaver import NanoVNASaver
 from NanoVNASaver.About import INFO, VERSION
 from NanoVNASaver.Hardware import VirtualVNA
 from NanoVNASaver.MCP import MCPOptions
+from NanoVNASaver.MCP.stdio_wire import claim_stdout
 from NanoVNASaver.Touchstone import Touchstone
 from NanoVNASaver.utils import get_runtime_information
 
@@ -110,6 +112,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.mcp == "stdio":
+        # before Qt or anything else can write to fd 1 (#189)
+        claim_stdout()
     if args.headless:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     if args.virtual is not None:
@@ -173,12 +178,56 @@ def main():
         t.load()
         window.setReference(t.s11, t.s21, args.ref_file)
         window.dataUpdated()
-    window.mcp.start(on_exit=app.quit)
+    on_exit = app.quit
+    if args.headless:
+        on_exit = _headless_exit(window, app)
+    window.mcp.start(on_exit=on_exit)
     try:
         app.exec()
     except BaseException as exc:
         logger.exception("%s", exc)
         raise exc
+    if args.headless and args.mcp == "stdio":
+        # The device is released already (_headless_exit). With mcp 1.x the
+        # stdio reader thread can still be blocked on sys.stdin, and normal
+        # interpreter shutdown then aborts ("could not acquire lock for
+        # <stdin>"), so leave without it.
+        logging.shutdown()
+        sys.stderr.flush()
+        os._exit(0)
+
+
+def _headless_exit(window: NanoVNASaver, app: QtWidgets.QApplication):
+    """Exit cleanly when the client goes away (stdin EOF, e.g. the ssh
+    connection closes) or on SIGTERM/SIGHUP: stop the sweep and release the
+    serial port before quitting (#189)."""
+    done = False
+
+    def finish() -> None:
+        nonlocal done
+        if done:
+            return
+        done = True
+        try:
+            window.shutdown()
+        finally:
+            app.quit()
+
+    def on_signal(signum: int, _frame: object) -> None:
+        logging.getLogger("NanoVNASaver").info(
+            "Signal %d, shutting down", signum
+        )
+        QtCore.QTimer.singleShot(0, finish)
+
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), on_signal)
+    # Python runs signal handlers only between bytecodes; wake up regularly
+    # so a signal is not left waiting inside the Qt event loop.
+    tick = QtCore.QTimer(app)
+    tick.timeout.connect(lambda: None)
+    tick.start(250)
+    return finish
 
 
 if __name__ == "__main__":

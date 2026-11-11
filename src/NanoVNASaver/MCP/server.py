@@ -30,16 +30,20 @@ Transports:
 
 import asyncio
 import inspect
+import io
 import json
 import logging
+import os
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyUrl, BaseModel, ConfigDict, Field, model_validator
 
+from . import stdio_wire
 from .bridge import MainThreadBridge
 from .control import AIControl, LogEntry
 from .prompts import register_prompts
@@ -137,6 +141,45 @@ class SaverMCP:
             self._add_tool(act)
         self._add_resources()
         register_prompts(self.server)
+        # client sessions seen in tool calls: (session, its event loop)
+        self._sessions: dict[int, tuple[Any, asyncio.AbstractEventLoop]] = {}
+        watch = getattr(api, "watch", None)
+        if watch is not None:
+            watch.changed.connect(self._device_changed)
+
+    # --- notifications ---------------------------------------------------
+
+    def _remember_session(self, ctx: Context | None) -> None:
+        try:
+            session = ctx.session if ctx is not None else None
+        except (AttributeError, ValueError, LookupError):
+            return
+        if session is not None:
+            self._sessions[id(session)] = (
+                session, asyncio.get_running_loop())
+
+    def _device_changed(self, info: dict) -> None:
+        """Main thread: tell every client that saver://device changed
+        (resource updated + a log message), best effort (#190)."""
+        for key, (session, loop) in list(self._sessions.items()):
+            if loop.is_closed():
+                self._sessions.pop(key, None)
+                continue
+            asyncio.run_coroutine_threadsafe(
+                self._push_device(key, session, info), loop
+            )
+
+    async def _push_device(self, key: int, session: Any, info: dict) -> None:
+        try:
+            await session.send_resource_updated(AnyUrl("saver://device"))
+            await session.send_log_message(
+                level="warning" if info.get("event") == "lost" else "info",
+                data=info,
+                logger="saver.device",
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Device notification dropped: %s", exc)
+            self._sessions.pop(key, None)
 
     # --- tools -----------------------------------------------------------
 
@@ -187,6 +230,11 @@ class SaverMCP:
             Risk.ACT: "Needs AI control allowed in Saver.",
             Risk.PERSIST: "Writes a file; asks the user every time.",
         }[act.risk]
+        if act.ui_permission:
+            risk_text += (
+                " Also needs the separate UI-control permission the user "
+                "grants for this device connection."
+            )
         self.server.add_tool(
             tool,
             name=act.name,
@@ -310,6 +358,7 @@ class SaverMCP:
         confirmation: Any = None,
     ) -> Any:
         started = time.monotonic()
+        self._remember_session(ctx)
 
         def log(outcome: str, detail: str = "") -> None:
             self.control.record(
@@ -329,6 +378,15 @@ class SaverMCP:
             raise Refused(
                 "AI-ohjaus ei ole sallittu. Pyydä käyttäjää sallimaan "
                 "AI-ohjaus Saverin AI (MCP) -paneelista."
+            )
+        if act.ui_permission and not self.control.input_allowed:
+            log("denied", "laitteen käyttöliittymän ohjaus ei ole sallittu")
+            raise Refused(
+                "Laitteen käyttöliittymän ohjaus ei ole sallittu. Pyydä "
+                "käyttäjää sallimaan 'Salli tekoälyn ohjata laitteen "
+                "käyttöliittymää' Saverin AI (MCP) -paneelista. Lupa on "
+                "voimassa vain nykyiselle laiteyhteydelle ja raukeaa "
+                "yhteyden katketessa tai STOPilla."
             )
         if self._act_lock is None:
             self._act_lock = asyncio.Lock()
@@ -368,8 +426,10 @@ class SaverMCP:
                     f"{act.name} ei valmistunut {act.timeout:.0f} s:ssa; "
                     "pyyhkäisy pysäytettiin."
                 ) from None
-            if not self.control.allowed and act.risk is not Risk.READ:
-                log("stopped", "käyttäjä painoi STOP, AI-ohjaus on pois")
+            if (not self.control.allowed and act.risk is not Risk.READ) or (
+                act.ui_permission and not self.control.input_allowed
+            ):
+                log("stopped", "käyttäjä painoi STOP tai laiteyhteys vaihtui")
                 raise Refused("Käyttäjä painoi STOP. AI-ohjaus on pois.")
         except (ActionError, ValueError) as exc:
             log("error", str(exc))
@@ -481,7 +541,7 @@ class SaverMCP:
 
         def run() -> None:
             try:
-                asyncio.run(self.server.run_stdio_async())
+                asyncio.run(self._serve_stdio())
             finally:
                 if on_exit is not None:
                     self.bridge.submit(on_exit)
@@ -489,6 +549,27 @@ class SaverMCP:
         self._thread = threading.Thread(target=run, name="mcp-stdio",
                                         daemon=True)
         self._thread.start()
+
+    async def _serve_stdio(self) -> None:
+        """Serve on the stdout claimed by stdio_wire.claim_stdout(), so
+        stray writes to fd 1 / sys.stdout go to stderr (#189)."""
+        out = stdio_wire.wire()
+        low = getattr(self.server, "_lowlevel_server", None) or getattr(
+            self.server, "_mcp_server", None
+        )
+        if out is None or low is None:
+            if out is not None:  # unknown mcp internals: give fd 1 back
+                os.dup2(out.fileno(), 1)
+                sys.stdout = sys.__stdout__
+            await self.server.run_stdio_async()
+            return
+        # pylint: disable=import-outside-toplevel
+        import anyio
+        from mcp.server.stdio import stdio_server
+
+        stdout = anyio.wrap_file(io.TextIOWrapper(out, encoding="utf-8"))
+        async with stdio_server(stdout=stdout) as (read, write):
+            await low.run(read, write, low.create_initialization_options())
 
 
 class _TokenGuard:

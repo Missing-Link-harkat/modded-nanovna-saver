@@ -62,6 +62,10 @@ class Action:
     confirm: Callable[..., str] | None = None
     # Seconds the action may take; sweeps take long.
     timeout: float = 30.0
+    # Needs the separate UI-control permission (AIControl.input_allowed) on
+    # top of AI control: the action drives the device's own user interface,
+    # which can do everything the device menu can do.
+    ui_permission: bool = False
     tags: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -76,6 +80,7 @@ def action(
     gui: tuple[str, ...] = (),
     confirm: Callable[..., str] | None = None,
     timeout: float = 30.0,
+    ui_permission: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register a method of SaverAPI as an action.
 
@@ -100,6 +105,7 @@ def action(
             gui=gui,
             confirm=confirm,
             timeout=timeout,
+            ui_permission=ui_permission,
         )
         return func
 
