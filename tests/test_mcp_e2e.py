@@ -5,6 +5,7 @@ server does); the test's main thread runs the Qt event loop.
 """
 
 import asyncio
+import base64
 import json
 import os
 import threading
@@ -17,6 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 mcp = pytest.importorskip("mcp")
 
 from PySide6 import QtWidgets  # noqa: E402
+from PySide6.QtGui import QImage  # noqa: E402
 
 from NanoVNASaver.Hardware import VirtualVNA  # noqa: E402
 from NanoVNASaver.MCP import MCPOptions  # noqa: E402
@@ -489,3 +491,86 @@ def test_data_at_parameter(saver):
     assert is_error(far) and "ulkopuolella" in far.content[0].text
     only11 = text(call(saver, "data_at", {"freq_hz": 143_000_000, "parameter": "s11"}))
     assert list(only11) == ["s11"]
+
+
+def test_unknown_argument_refused(saver):
+    """A guessed parameter is an error, not a silent "ok" (the model
+    would believe it was used)."""
+    _, window, _ = saver
+    window.mcp.control.allow(True)
+    call(saver, "device_connect", {"port": "virtual"})
+    before = text(call(saver, "sweep_get"))["start_hz"]
+    result = call(saver, "sweep_configure",
+                  {"start_hz": before + 1_000_000, "bogus_param": 123})
+    assert is_error(result)
+    msg = result.content[0].text
+    assert "Tuntematon parametri bogus_param" in msg
+    assert "start_hz" in msg and "stop_hz" in msg
+    # nothing was applied
+    assert text(call(saver, "sweep_get"))["start_hz"] == before
+    # a tool without parameters says so
+    none = call(saver, "marker_add", {"freq_hz": 14_200_000})
+    assert is_error(none)
+    assert "ei parametreja" in none.content[0].text
+
+
+def test_schema_forbids_additional_properties(saver):
+    qapp, _, svc = saver
+
+    async def go():
+        async with Client(svc.server) as c:
+            return (await c.list_tools()).tools
+
+    for tool in run(qapp, go):
+        schema = getattr(tool, "input_schema", None) or tool.inputSchema
+        assert schema.get("additionalProperties") is False, tool.name
+
+
+def test_persist_without_confirmation_channel(saver):
+    """Headless with a client that cannot be asked: refused with a
+    reason, not as if the user had said no."""
+    _, window, _ = saver
+    window.mcp.control.allow(True)
+    result = call(saver, "file_export_touchstone", {"path": "noask.s1p"})
+    assert is_error(result)
+    msg = result.content[0].text
+    assert "Kuittausta ei voitu pyytää" in msg
+    assert "ei hyväksynyt" not in msg
+    assert not (window.mcp.service.api.workspace / "noask.s1p").exists()
+    entry = window.mcp.control.entries[-1]
+    assert entry.outcome == "denied"
+    assert entry.detail == "kuittausta ei voitu pyytää"
+
+
+def test_virtual_device_screenshot(saver):
+    """VirtualVNA has a simulated 480x320 screen. The same range gives
+    the same image (no noise), another range a different one."""
+    _, window, _ = saver
+    window.mcp.control.allow(True)
+    call(saver, "device_connect", {"port": "virtual"})
+    call(saver, "sweep_configure",
+         {"start_hz": 10_000_000, "stop_hz": 20_000_000, "segments": 1})
+    call(saver, "sweep_run")  # the device's range follows the sweep
+
+    def shot():
+        result = call(saver, "device_screenshot")
+        assert not is_error(result), result.content[0].text
+        img = result.content[0]
+        assert img.type == "image"
+        return img.data
+
+    first, again = shot(), shot()
+    assert first == again
+    image = QImage.fromData(base64.b64decode(first))
+    assert (image.width(), image.height()) == (480, 320)
+    yellow = sum(
+        1
+        for x in range(40, 480, 4)
+        for y in range(24, 296, 2)
+        if image.pixelColor(x, y).name() == "#ffff00"
+    )
+    assert yellow > 20  # the S11 trace is drawn
+    call(saver, "sweep_configure",
+         {"start_hz": 1_000_000, "stop_hz": 5_000_000, "segments": 1})
+    call(saver, "sweep_run")
+    assert shot() != first
