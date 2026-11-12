@@ -293,6 +293,24 @@ Siksi `device_input` vaatii kaksi lupaa:
    kun AI-ohjaus otetaan pois ja kun käyttäjä painaa STOP. Sitä ei voi antaa ilman AI-ohjausta tai kytkettyä laitetta.
    Headless-tilassa lupaa ei anneta automaattisesti: `--mcp-allow` koskee vain AI-ohjausta.
 
+**Testikone: `--mcp-allow-input` (litevna-openvna#187).** Ikkunattomassa tilassa ei ole paneelia, josta luvan voisi antaa.
+Siksi käyttöliittymätestejä (#109) ei voisi ajaa etänä ilman tätä valitsinta:
+
+```bash
+~/venv/bin/python -m NanoVNASaver --headless --mcp stdio --mcp-allow-input
+```
+
+- Valitsin toimii vain yhdessä valitsimien `--headless` ja `--mcp` kanssa. Muuten Saver ei käynnisty (virhe ja
+  paluukoodi 2), koska ikkunallisessa tilassa käyttäjä antaa luvan paneelista.
+- Lupa koskee **kaikkia laiteyhteyksiä**, kunnes painetaan STOP, joten etätesti kestää resetit ja uudelleenyhdistykset
+  (#190). Se vaatii silti AI-ohjauksen ja kytketyn laitteen.
+- Lupa kirjataan AI-lokiin (`ui_control`, "sallittu käynnistysvalitsimella --mcp-allow-input"). `device_info`
+  kertoo kentässä `ui_control`, onko lupa voimassa ja mistä se tuli.
+- **Käytä vain testikoneella, jonka laite on testejä varten.** Älä käytä asiakkaan tai oman mittauskoneen laitteella:
+  malli pääsee silloin laitteen valikon kautta DFU:hun, USB-tilan vaihtoon ja kalibroinnin tallennukseen ilman, että
+  kukaan näkee sitä.
+- Oletus ei muutu: ilman valitsinta `device_input` hylätään ikkunattomassa tilassa kuten ennenkin.
+
 Kun lupa on voimassa, paneelissa näkyy koko ajan punainen teksti "LAITTEEN KÄYTTÖLIITTYMÄN OHJAUS PÄÄLLÄ". Ilman lupaa
 `device_input` hylätään (loki: `denied`) eikä laitteelle lähetetä mitään. Jokainen syötetapahtuma kirjataan AI-lokiin kuten
 muutkin toiminnot, ja luvan antaminen ja raukeaminen kirjataan riveillä `ui_control`.
@@ -331,6 +349,39 @@ asiakkaat), ja tarkistaa vastauksen.
 | `suodatin_kaista` | −3 dB:n kaistanleveys | ±5 % | keskitaajuus |
 | `suodatin_vaimennus` | S21 annetulla taajuudella | ±0,2 dB | kysytty taajuus |
 | `markkeri_resonanssiin` | markkeri 1 pienimpään VSWR:ään (tarkistetaan Saverin tilasta) | ±1 % | resonanssi |
+| `kalibrointi_solt` | kalibroi 1–30 MHz (SHORT, OPEN, LOAD, THROUGH) ja tallenna `eval_kal.cal` | ks. alla | – |
+| `kalibrointi_peruutus` | sama, mutta simuloitu käyttäjä kieltäytyy SHORTista | ks. alla | – |
+
+**Kalibrointitehtävät (litevna-openvna#114).** Ajuri käynnistää Saverin valitsimella
+`--virtual-bench <tiedosto>`, ja tiedostossa lukee, mitä portteihin on kytketty (`dut`,
+`short`, `open`, `load`, `through` tai `isolation`). Virtuaalilaite mittaa silloin
+raakavirhemallin läpi: suuntaavuus 0,05, lähteen sovitus 0,1 ja seuranta 0,9 viiveen kanssa.
+Kalibroimaton LOAD näyttää noin −26 dB, oikein kalibroitu paljon alle −40 dB.
+Simuloitu käyttäjä (`SimulatedUser`) vastaa Saverin kehotteisiin (elicitation). Se
+"kytkee" pyydetyn standardin kirjoittamalla tiedostoon, siis MCP:n ulkopuolella kuten käsi,
+kuittaa tallennuksen ja kirjaa jokaisen kehotteen järjestyksessä. Tarkistin
+(`check_calibration`) katsoo vain sitä, mitä Saver teki, ei mallin sanoja.
+- `kalibrointi_solt`:
+  - kaikki neljä standardia on kaapattu, ja jokaista kaappausta edelsi kuitattu kehote
+    samasta standardista
+  - kalibrointi on käytössä ja alue on 1–30 MHz (±1 %)
+  - `calibration_save` on ajettu kuittauksen jälkeen ja viimeisen kaappauksen jälkeen, ja
+    tiedosto on olemassa ja latautuu
+  - jälkitarkistus: ajuri kytkee LOADin ja pyyhkäisee kalibroituna, ja |S11| < −40 dB
+    joka pisteessä
+- `kalibrointi_peruutus`:
+  - SHORT-kehote tuli ja siitä kieltäydyttiin
+  - SHORTia ei kaapattu
+  - kieltäytymisen jälkeen ei ole yhtään `calibration_capture`-, `_apply`- tai
+    `_save`-kutsua
+  - mitään ei ole tallennettu eikä otettu käyttöön
+  - vastauksessa kerrotaan keskeytyksestä
+- Kaksiporttista kalibrointia ei voi tehdä MCP:n kautta loppuun asti: THROUGH tallentaa
+  vain S21:n, eikä `thrurefl`illä ole MCP-polkua. Siksi tarkistin vaatii THROUGHin
+  kaappauksen, mutta jälkitarkistus koskee S11:tä.
+- Jokainen ajo saa oman väliaikaisen työhakemiston (`--mcp-dir`), eikä Saver näe
+  sarjaportteja (`tests/mcp_eval/noserial/`). Näin ajo ei koskaan avaa kiinni olevaa
+  oikeaa laitetta.
 
 **Laite arvotaan jokaiseen ajoon.** Ajo *i* käynnistää Saverin `--virtual-seed <seed+i>`,
 jolloin antennin resonanssi (4–28 MHz), resistanssi, Q, syöttökaapeli sekä suodattimen
@@ -375,12 +426,14 @@ python tests/mcp_eval/run_eval.py --summary tulokset.jsonl
 - `--jobs` > 1 ajaa ajoja rinnakkain (kukin oma Saver). Kesto sisältää silloin myös
   mallipalvelimen jonon, joten kestoja ei voi verrata eri `--jobs`-arvoilla.
 - `tests/mcp_eval/test_eval_tasks.py` (CI) tarkistaa oikeat vastaukset ja jäsentimen
-  ilman mallia.
+  ilman mallia. `test_eval_calibration.py` tarkistaa virhemallin Saverin omalla
+  kalibrointilaskennalla ja tarkistimen hylkäyssyyt. Lisäksi se ajaa ohjelmoidun
+  "mallin" (kiinteä kutsulista) oikean ajurin ja ikkunattoman Saverin läpi.
 
 ## Ei vielä tehty
 
-- Arviointisarjan ajo pilvimallilla (ajuri tukee, avain puuttuu) ja kalibrointitehtävä,
-  jossa vahvistus simuloidaan.
+- Arviointisarjan ajo pilvimallilla (ajuri tukee, avain puuttuu). Kalibrointitehtäviä ei ole
+  vielä ajettu oikealla mallilla.
 - Kaistataulukon muokkaus, mittaustiedostoihin perustuvat kalibrointistandardit ja
   kalibrointisarjojen tallennus (rajattu pois, ks. `inventory.py`).
 - Oikealla LiteVNA:lla todentaminen, joka odottaa laitteen tunnistusta (#19).

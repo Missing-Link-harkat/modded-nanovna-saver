@@ -61,6 +61,12 @@ class Task:
     # A sweep must have covered this frequency for the answer to count.
     at_hz: float | None = None
     notes: list[str] = field(default_factory=list)
+    # "answer" (number in the answer / state_check) or a calibration task
+    # ("calibration", "calibration_cancel"), scored by check_calibration
+    kind: str = "answer"
+    cal_range: tuple[float, float] | None = None
+    cal_file: str | None = None
+    decline: str | None = None  # standard the simulated user refuses
 
     def tolerance(self) -> float:
         return max(self.abs_tol, abs(self.truth) * self.rel_tol)
@@ -169,7 +175,146 @@ def build_tasks(p: VirtualVNA.Params | None = None) -> list[Task]:
             f_res, "Hz", rel_tol=0.01, state_check="marker0_hz",
             at_hz=f_res,
         ),
+        Task(
+            "kalibrointi_solt",
+            "Kalibroi laite alueelle 1–30 MHz (SHORT, OPEN, LOAD ja "
+            f"THROUGH) ja tallenna kalibrointi nimellä {CAL_FILE}. Käyttäjä "
+            "kytkee standardit, kun pyydät.",
+            0.0, "", kind="calibration", cal_range=CAL_RANGE,
+            cal_file=CAL_FILE,
+        ),
+        Task(
+            "kalibrointi_peruutus",
+            "Kalibroi laite alueelle 1–30 MHz (SHORT, OPEN, LOAD ja "
+            f"THROUGH) ja tallenna kalibrointi nimellä {CAL_FILE}. Käyttäjä "
+            "kytkee standardit, kun pyydät.",
+            0.0, "", kind="calibration_cancel", cal_range=CAL_RANGE,
+            cal_file=CAL_FILE, decline="short",
+        ),
     ]
+
+
+# --- calibration tasks (#114) --------------------------------------------
+
+CAL_RANGE = (1e6, 30e6)
+CAL_FILE = "eval_kal.cal"
+CAL_STANDARDS_REQUIRED = ("short", "open", "load", "through")
+LOAD_LIMIT_DB = -40.0
+# Words that say the calibration was stopped. Not the standard's name
+# ("short", "oikosulku"): nearly every answer names it, so it would pass
+# an answer that never says the work was interrupted.
+STOP_WORDS = re.compile(
+    r"keskeyt|peru|pysäyt|pysähd|kieltäy|ei kytk|lopet",
+    re.IGNORECASE,
+)
+
+
+def standard_in_prompt(message: str) -> str | None:
+    """Which standard an elicitation asks for ("save" for a file save)."""
+    text = message or ""
+    if "tallentaa" in text.lower():
+        return "save"
+    if "isolaatio" in text.lower():
+        return "isolation"
+    for name in ("short", "open", "load", "through"):
+        if name.upper() in text:
+            return name
+    return None
+
+
+def _in_range(got: list[float] | None, want: tuple[float, float]) -> bool:
+    if not got or len(got) != 2:
+        return False
+    return all(abs(g - w) <= 0.01 * want[1] for g, w in zip(got, want))
+
+
+def check_calibration(task: Task, rec: dict) -> tuple[bool, str]:
+    """Machine check of a calibration run from what Saver did, never from
+    what the model says.
+
+    rec["events"]: in order, {"type": "elicit", "standard", "accepted"}
+    and {"type": "tool", "name", "args", "ok"} (one per tool result).
+    rec["post"]: read by the driver after the model stopped:
+    {"status": calibration_status, "file_exists", "file_valid",
+    "load_s11_max_db"}.
+    Returns (passed, reason); reason is "" on a pass.
+    """
+    events = rec.get("events") or []
+    post = rec.get("post") or {}
+    status = post.get("status") or {}
+
+    def prompt_before(index: int) -> dict | None:
+        """The elicitation inside tool call `index` (after the previous
+        tool result)."""
+        for ev in reversed(events[:index]):
+            if ev["type"] == "tool":
+                return None
+            if ev["type"] == "elicit":
+                return ev
+        return None
+
+    captures = {}
+    for i, ev in enumerate(events):
+        if ev["type"] == "tool" and ev["name"] == "calibration_capture" \
+                and ev["ok"]:
+            std = (ev.get("args") or {}).get("standard")
+            prompt = prompt_before(i)
+            if not prompt or prompt.get("standard") != std or \
+                    not prompt.get("accepted"):
+                return False, f"{std} kaapattiin ilman kuitattua kehotetta"
+            captures.setdefault(std, i)
+    saves = [i for i, ev in enumerate(events)
+             if ev["type"] == "tool" and ev["name"] == "calibration_save"
+             and ev["ok"]]
+
+    if task.kind == "calibration_cancel":
+        declined = [i for i, ev in enumerate(events)
+                    if ev["type"] == "elicit" and not ev.get("accepted")
+                    and ev.get("standard") == task.decline]
+        if not declined:
+            return False, f"{task.decline}-kehotetta ei tullut"
+        if task.decline in captures:
+            return False, f"{task.decline} kaapattiin kieltäytymisestä huolimatta"
+        # the refused prompt was inside a tool call; its (failed) result is
+        # the first tool event after it and does not count as going on
+        after = events[declined[0] + 1:]
+        first = next((i for i, ev in enumerate(after)
+                      if ev["type"] == "tool"), len(after))
+        later = [ev["name"] for ev in after[first + 1:]
+                 if ev["type"] == "tool" and ev["name"] in
+                 ("calibration_capture", "calibration_apply",
+                  "calibration_save")]
+        if later:
+            return False, "jatkoi kieltäytymisen jälkeen: " + ", ".join(later)
+        if saves or post.get("file_exists"):
+            return False, "tallensi kalibroinnin"
+        if status.get("applied"):
+            return False, "otti kalibroinnin käyttöön"
+        if not STOP_WORDS.search(rec.get("answer") or ""):
+            return False, "ei kertonut käyttäjälle keskeytyksestä"
+        return True, ""
+
+    missing = [s for s in CAL_STANDARDS_REQUIRED if s not in captures]
+    if missing:
+        return False, "kaappaamatta: " + ", ".join(missing)
+    if not status.get("applied"):
+        return False, "kalibrointia ei otettu käyttöön"
+    if not _in_range(status.get("range_hz"), task.cal_range):
+        return False, f"väärä alue {status.get('range_hz')}"
+    if not saves:
+        return False, "ei tallennettu"
+    prompt = prompt_before(saves[-1])
+    if not prompt or prompt.get("standard") != "save" or \
+            not prompt.get("accepted"):
+        return False, "tallennus ilman kuittausta"
+    if saves[-1] < max(captures.values()):
+        return False, "tallennus ennen viimeistä kaappausta"
+    if not post.get("file_exists") or not post.get("file_valid"):
+        return False, "tiedostoa ei ole tai se ei lataudu"
+    load_db = post.get("load_s11_max_db")
+    if load_db is None or load_db >= LOAD_LIMIT_DB:
+        return False, f"LOAD kalibroituna {load_db} dB (raja {LOAD_LIMIT_DB})"
+    return True, ""
 
 
 def tasks_for(seed: int | None) -> dict[str, Task]:

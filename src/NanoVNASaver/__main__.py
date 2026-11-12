@@ -85,6 +85,13 @@ def main():
         help="Allow AI control at start (otherwise the user ticks it)",
     )
     parser.add_argument(
+        "--mcp-allow-input",
+        action="store_true",
+        help="Headless test machine only: allow device_input (driving the "
+        "device's own UI, which can reach DFU, USB mode and saving) for "
+        "every connection until STOP. Logged. Needs --headless",
+    )
+    parser.add_argument(
         "--mcp-dir",
         type=Path,
         help="Work folder for files read/written by MCP",
@@ -108,9 +115,19 @@ def main():
         help="Simulated antenna and filter drawn from seed N",
     )
     parser.add_argument(
+        "--virtual-bench",
+        metavar="FILE",
+        help="Simulated calibration bench: FILE names what is connected "
+        "(dut, short, open, load, through, isolation) and the simulated "
+        "VNA measures through a raw error model",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"NanoVNASaver {VERSION}"
     )
     args = parser.parse_args()
+    if args.mcp_allow_input and not (args.headless and args.mcp != "off"):
+        # with a window the user grants it in the AI panel, per connection
+        parser.error("--mcp-allow-input needs --headless and --mcp")
 
     if args.mcp == "stdio":
         # before Qt or anything else can write to fd 1 (#189)
@@ -118,7 +135,11 @@ def main():
     if args.headless:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     if args.virtual is not None:
-        VirtualVNA.enable(args.virtual or None, seed=args.virtual_seed)
+        VirtualVNA.enable(
+            args.virtual or None,
+            seed=args.virtual_seed,
+            bench=args.virtual_bench,
+        )
 
     console_log_level = logging.WARNING
     file_log_level = logging.DEBUG
@@ -161,6 +182,7 @@ def main():
             allow=args.mcp_allow,
             workspace=args.mcp_dir,
             headless=args.headless,
+            allow_input=args.mcp_allow_input,
         )
     )
     if not args.headless:

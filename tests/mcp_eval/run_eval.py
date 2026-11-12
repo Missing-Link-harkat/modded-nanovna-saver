@@ -47,9 +47,11 @@ tool schemas fit) and "openai" (any OpenAI compatible
 import argparse
 import asyncio
 import json
+import math
 import os
 import statistics
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -63,7 +65,17 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(HERE))
 
 from mcp import Client, StdioServerParameters  # noqa: E402
-from tasks import TASKS, Task, parse_answer, tasks_for  # noqa: E402
+from mcp import types as mcp_types  # noqa: E402
+from tasks import (  # noqa: E402
+    TASKS,
+    Task,
+    check_calibration,
+    parse_answer,
+    standard_in_prompt,
+    tasks_for,
+)
+
+from NanoVNASaver.Calibration import Calibration  # noqa: E402
 
 SYSTEM = (
     "Ohjaat NanoVNA-Saver-ohjelmaa ja siihen kytkettyä vektoriverkko-"
@@ -192,19 +204,103 @@ def sweep_range(text: str) -> tuple[float, float] | None:
         return None
 
 
+class SimulatedUser:
+    """Plays the person at the bench in calibration tasks (#114): answers
+    Saver's elicitations, "connects" each standard it is asked for by
+    writing the --virtual-bench file (outside MCP, like a hand), and
+    refuses `decline`. Every prompt goes to `events` in order."""
+
+    def __init__(self, bench: Path, events: list, decline: str | None):
+        self.bench = bench
+        self.events = events
+        self.decline = decline
+        bench.write_text("dut", encoding="utf-8")  # the antenna
+
+    async def __call__(self, _ctx, params):
+        message = getattr(params, "message", "") or ""
+        standard = standard_in_prompt(message)
+        accept = standard is not None and standard != self.decline
+        if accept and standard != "save":
+            self.bench.write_text(standard, encoding="utf-8")
+        self.events.append({"type": "elicit", "standard": standard,
+                            "accepted": accept, "message": message[:200]})
+        if accept:
+            return mcp_types.ElicitResult(action="accept",
+                                          content={"ok": True})
+        return mcp_types.ElicitResult(action="decline")
+
+
+async def calibration_post(client, task: Task, bench: Path,
+                           workspace: Path) -> dict:
+    """What the checker needs, read after the model stopped: status, the
+    saved file, and |S11| of a LOAD measured with the calibration on."""
+    post: dict = {}
+    res = await client.call_tool("calibration_status", {})
+    post["status"] = json.loads(res.content[0].text)
+    path = workspace / (task.cal_file or "")
+    post["file_exists"] = path.is_file()
+    post["file_valid"] = False
+    if post["file_exists"]:
+        try:
+            cal = Calibration()
+            cal.load(str(path))
+            post["file_valid"] = cal.isValid1Port()
+        except Exception:  # pylint: disable=broad-except
+            pass
+    post["load_s11_max_db"] = None
+    if post["status"].get("applied"):
+        bench.write_text("load", encoding="utf-8")
+        res = await client.call_tool("sweep_run", {})
+        if not result_text(res).startswith("VIRHE"):
+            text = await client.read_resource("saver://sweep/latest.s1p")
+            body = "".join(getattr(c, "text", "") for c in text.contents)
+            mags = []
+            for line in body.splitlines():
+                cols = line.split()
+                if len(cols) >= 3 and not line.startswith(("!", "#")):
+                    mags.append(abs(complex(float(cols[1]), float(cols[2]))))
+            if mags:
+                post["load_s11_max_db"] = round(
+                    20 * math.log10(max(max(mags), 1e-12)), 1)
+    return post
+
+
 async def run_once(task: Task, backend: Backend, max_turns: int,
                    seed: int, ohje: bool) -> dict:
+    with tempfile.TemporaryDirectory(prefix="mcp_eval_") as tmp:
+        return await _run_once(task, backend, max_turns, seed, ohje,
+                               Path(tmp))
+
+
+async def _run_once(task: Task, backend: Backend, max_turns: int,
+                    seed: int, ohje: bool, tmp: Path) -> dict:
+    calibrating = task.kind != "answer"
+    bench = tmp / "bench.txt"
+    workspace = tmp / "ws"
+    argv = ["-m", "NanoVNASaver", "--headless", "--mcp", "stdio",
+            "--virtual", "--virtual-seed", str(seed),
+            "--mcp-dir", str(workspace)]  # never the user's own folder
+    if calibrating:
+        argv += ["--virtual-bench", str(bench)]
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "NanoVNASaver", "--headless", "--mcp", "stdio",
-              "--virtual", "--virtual-seed", str(seed)],
-        env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
+        args=argv,
+        env={**os.environ,
+             # noserial: never probe a real VNA that is plugged in
+             "PYTHONPATH": os.pathsep.join(
+                 p for p in (str(HERE / "noserial"), str(ROOT / "src"),
+                             os.environ.get("PYTHONPATH", "")) if p),
              "QT_QPA_PLATFORM": "offscreen"},
         cwd=str(ROOT),
     )
     rec: dict = {"tools": [], "turns": 0, "tokens": 0, "answer": "",
                  "sweeps": []}
-    async with Client(params) as client:
+    events: list = []
+    user = None
+    if calibrating:
+        rec["events"] = events
+        user = SimulatedUser(bench, events, task.decline)
+    async with Client(params, elicitation_callback=user) as client:
         specs = tool_specs((await client.list_tools()).tools)
         system = SYSTEM.format(ohje=OHJE if ohje else "")
         if client.instructions:
@@ -233,11 +329,18 @@ async def run_once(task: Task, backend: Backend, max_turns: int,
                     span = sweep_range(text)
                     if span:
                         rec["sweeps"].append(span)
+                if calibrating:
+                    events.append({"type": "tool", "name": name,
+                                   "args": args or {},
+                                   "ok": not text.startswith("VIRHE")})
                 messages.append(backend.tool_message(call_id, name, text))
         else:
             rec["stopped"] = "max_turns"
         if task.state_check:
             rec["state"] = await read_state(client, task.state_check)
+        if calibrating:
+            rec["post"] = await calibration_post(client, task, bench,
+                                                 workspace)
     return rec
 
 
@@ -256,7 +359,12 @@ def describe(exc: BaseException) -> str:
 
 def score(task: Task, rec: dict) -> dict:
     """pass needs both the right value and a sweep that covered
-    task.at_hz; "reason" tells a guess from a wrong measurement."""
+    task.at_hz; "reason" tells a guess from a wrong measurement.
+    Calibration tasks are scored from Saver's events (check_calibration)."""
+    if task.kind != "answer":
+        passed, reason = check_calibration(task, rec)
+        return {"value": None, "checked": None, "measured": True,
+                "pass": passed, "reason": reason}
     value = parse_answer(rec["answer"], task.unit)
     checked = rec.get("state") if task.state_check else value
     measured = task.at_hz is None or any(
