@@ -30,6 +30,7 @@ be answered from memory of the default values.
 import logging
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from time import sleep
 
 import numpy as np
@@ -86,12 +87,73 @@ class Params:
 
 PARAMS = Params()
 
+# Calibration bench (--virtual-bench FILE, litevna-openvna#114): the file
+# names what is connected to the ports, written by whoever plays the user
+# (the evaluation driver), never through MCP. The device then measures
+# through a raw error model, so only a correct calibration gives a clean
+# result: an uncorrected LOAD reads about -26 dB, a corrected one far
+# below -40 dB.
+BENCH: Path | None = None
+BENCH_STANDARDS = ("dut", "short", "open", "load", "through", "isolation")
+GAMMA = {"short": -1.0, "open": 1.0, "load": 0.0}
 
-def enable(source: str | None = None, seed: int | None = None) -> None:
-    global ENABLED, SOURCE, PARAMS  # noqa: PLW0603  pylint: disable=global-statement
+
+def enable(
+    source: str | None = None,
+    seed: int | None = None,
+    bench: str | Path | None = None,
+) -> None:
+    global ENABLED, SOURCE, PARAMS, BENCH  # noqa: PLW0603  pylint: disable=global-statement
     ENABLED = True
     SOURCE = source
     PARAMS = Params() if seed is None else Params.from_seed(seed)
+    BENCH = Path(bench) if bench else None
+
+
+def bench_connected(path: Path | None = None) -> str:
+    """What the bench file says is connected ("dut" when empty/missing)."""
+    path = path or BENCH
+    try:
+        text = path.read_text(encoding="utf-8").strip().lower() if path else ""
+    except OSError:
+        text = ""
+    return text if text in BENCH_STANDARDS else "dut"
+
+
+def raw_errors(freqs: np.ndarray) -> dict[str, np.ndarray]:
+    """Error terms of the simulated, uncalibrated device: directivity
+    e00, source match e11, reflection tracking e10e01 (with a little
+    cable delay), isolation e30 and transmission tracking e10e32."""
+    w = 2 * math.pi * freqs
+    tau = 0.35e-9  # one way, about 7 cm of cable inside the box
+    return {
+        "e00": 0.05 * np.exp(-1j * w * 0.6e-9),
+        "e11": 0.10 * np.exp(-1j * w * 0.9e-9),
+        "e10e01": 0.90 * np.exp(-2j * w * tau),
+        "e30": np.full(len(freqs), 0.001 + 0j),
+        "e10e32": 0.92 * np.exp(-2j * w * tau),
+    }
+
+
+def bench_values(
+    freqs: np.ndarray, connected: str, p: Params | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Raw S11, S21 with `connected` on the ports."""
+    if connected in GAMMA:
+        gamma = np.full(len(freqs), GAMMA[connected], dtype=complex)
+        s21 = np.zeros(len(freqs), dtype=complex)
+    elif connected == "through":
+        gamma = np.zeros(len(freqs), dtype=complex)
+        s21 = np.ones(len(freqs), dtype=complex)
+    elif connected == "isolation":
+        gamma = np.zeros(len(freqs), dtype=complex)
+        s21 = np.zeros(len(freqs), dtype=complex)
+    else:
+        gamma, s21 = model(freqs, p)
+    e = raw_errors(freqs)
+    s11m = e["e00"] + e["e10e01"] * gamma / (1 - e["e11"] * gamma)
+    s21m = e["e30"] + e["e10e32"] * s21
+    return s11m, s21m
 
 
 def make_interface() -> "VirtualInterface":
@@ -213,6 +275,8 @@ class VirtualVNA(VNA):
         return [round(f) for f in self._freqs()]
 
     def _values(self, freqs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if BENCH is not None:
+            return bench_values(freqs, bench_connected())
         if self._file is None:
             return model(freqs)
         out = []
