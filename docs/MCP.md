@@ -282,6 +282,24 @@ Siksi `device_input` vaatii kaksi lupaa:
    kun AI-ohjaus otetaan pois ja kun käyttäjä painaa STOP. Sitä ei voi antaa ilman AI-ohjausta tai kytkettyä laitetta.
    Headless-tilassa lupaa ei anneta automaattisesti: `--mcp-allow` koskee vain AI-ohjausta.
 
+**Testikone: `--mcp-allow-input` (litevna-openvna#187).** Ikkunattomassa tilassa ei ole paneelia, josta luvan voisi antaa.
+Siksi käyttöliittymätestejä (#109) ei voisi ajaa etänä ilman tätä valitsinta:
+
+```bash
+~/venv/bin/python -m NanoVNASaver --headless --mcp stdio --mcp-allow-input
+```
+
+- Valitsin toimii vain yhdessä valitsimien `--headless` ja `--mcp` kanssa. Muuten Saver ei käynnisty (virhe ja
+  paluukoodi 2), koska ikkunallisessa tilassa käyttäjä antaa luvan paneelista.
+- Lupa koskee **kaikkia laiteyhteyksiä**, kunnes painetaan STOP, joten etätesti kestää resetit ja uudelleenyhdistykset
+  (#190). Se vaatii silti AI-ohjauksen ja kytketyn laitteen.
+- Lupa kirjataan AI-lokiin (`ui_control`, "sallittu käynnistysvalitsimella --mcp-allow-input"). `device_info`
+  kertoo kentässä `ui_control`, onko lupa voimassa ja mistä se tuli.
+- **Käytä vain testikoneella, jonka laite on testejä varten.** Älä käytä asiakkaan tai oman mittauskoneen laitteella:
+  malli pääsee silloin laitteen valikon kautta DFU:hun, USB-tilan vaihtoon ja kalibroinnin tallennukseen ilman, että
+  kukaan näkee sitä.
+- Oletus ei muutu: ilman valitsinta `device_input` hylätään ikkunattomassa tilassa kuten ennenkin.
+
 Kun lupa on voimassa, paneelissa näkyy koko ajan punainen teksti "LAITTEEN KÄYTTÖLIITTYMÄN OHJAUS PÄÄLLÄ". Ilman lupaa
 `device_input` hylätään (loki: `denied`) eikä laitteelle lähetetä mitään. Jokainen syötetapahtuma kirjataan AI-lokiin kuten
 muutkin toiminnot, ja luvan antaminen ja raukeaminen kirjataan riveillä `ui_control`.

@@ -47,6 +47,8 @@ class MCPOptions:
     allow: bool = False
     workspace: Path | None = None
     headless: bool = False
+    # --mcp-allow-input: device_input allowed for every connection (#187)
+    allow_input: bool = False
 
 
 def mcp_available() -> bool:
@@ -119,6 +121,8 @@ class MCPSupport:
             return
         if self.options.allow or self.options.headless:
             self.control.allow(True, by="command line")
+        if self.options.allow_input and self.options.headless:
+            self.control.allow_input_standing(by="command line")
         if self.options.mode == "stdio":
             self.build_service().start_stdio(on_exit=on_exit)
         elif self.options.mode == "http":

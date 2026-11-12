@@ -26,6 +26,8 @@ Rules:
     separate permission, granted once per device connection ("Salli
     tekoälyn ohjata laitteen käyttöliittymää"). It expires when the
     connection changes or drops, when AI control is revoked, and on STOP.
+    Exception: --mcp-allow-input (with --headless only, for a test
+    machine, #187) grants it for every connection until STOP.
     The device menu can do everything, including DFU, saving a calibration
     and switching the USB mode, so this is never implied by AI control.
   * STOP (GUI button or Esc in the AI panel) stops the sweep and revokes
@@ -86,6 +88,10 @@ class AIControl:
         self._allowed = False
         self._input_allowed = False
         self._input_conn: object | None = None
+        # --mcp-allow-input (headless test machine, #187): valid for every
+        # connection, so a remote test survives resets and reconnects;
+        # still needs AI control and a connected device; STOP ends it.
+        self._input_standing = False
         self._active_tool: str | None = None
         # Identifies the current device connection (the VNA object while it
         # is connected, else None); MCPSupport sets it. The UI-control
@@ -127,6 +133,8 @@ class AIControl:
         allowed. A stale permission is revoked (and logged) here."""
         reason = None
         with self._lock:
+            if self._input_standing:
+                return self._allowed and self.connection() is not None
             if not self._input_allowed:
                 return False
             if not self._allowed:
@@ -160,10 +168,36 @@ class AIControl:
                                  "laiteyhteydelle"))
         return True
 
+    def allow_input_standing(self, by: str = "command line") -> None:
+        """--mcp-allow-input: UI control for every device connection of
+        this Saver process (headless test machine only). Logged."""
+        with self._lock:
+            self._input_standing = True
+        logger.warning("UI control allowed by %s for all connections", by)
+        self.record(LogEntry(time.time(), "ui_control", "act", {"by": by},
+                             "ok",
+                             "Käyttöliittymän ohjaus sallittu "
+                             "käynnistysvalitsimella --mcp-allow-input "
+                             "kaikille laiteyhteyksille"))
+        self._notify()
+
+    def input_status(self) -> dict:
+        """For device_info: is UI control allowed, and by what."""
+        allowed = self.input_allowed
+        with self._lock:
+            standing = self._input_standing
+        return {
+            "allowed": allowed,
+            "granted": ("command line (--mcp-allow-input), all connections"
+                        if standing else
+                        "user, this connection" if allowed else None),
+        }
+
     def _revoke_input(self, reason: str) -> None:
         with self._lock:
-            was = self._input_allowed
+            was = self._input_allowed or self._input_standing
             self._input_allowed = False
+            self._input_standing = False
             self._input_conn = None
         if was:
             logger.info("UI control revoked: %s", reason)
