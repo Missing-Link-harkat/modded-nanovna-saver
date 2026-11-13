@@ -7,7 +7,6 @@ values" on every segment of a long sweep. Lowpass mirrors the spectrum to
 data; short sweeps keep exactly the old result.
 """
 
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -78,13 +77,10 @@ def test_long_sweep_40501_points(qapp, fmt):
     assert len(window.td) == n
     assert len(window.distance_axis) == n
     assert np.all(np.isfinite(np.real(window.td)))
-    # The chart draws it too. Only on Python 3.12+: PySide6 6.12 drops a
-    # reference to None on every QPainter.drawPoint/drawLine on 3.10/3.11,
-    # and 2 x 65536 points per paint deallocate None (abort). That leak is
-    # not TDR's (every chart has it); None is immortal from 3.12 on.
-    if sys.version_info >= (3, 12):
-        window.app.tdr_chart.resize(600, 400)
-        window.app.tdr_chart.grab()
+    # the chart draws it too (on Python < 3.12 this needs a PySide6 without the
+    # None leak of #22, see test_qpainter_none_refcount.py)
+    window.app.tdr_chart.resize(600, 400)
+    window.app.tdr_chart.grab()
 
 
 def test_line_drawing_limit_2049_points(qapp):
