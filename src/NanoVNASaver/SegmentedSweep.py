@@ -27,6 +27,11 @@ point count, so the measured spacing is the requested step
 from dataclasses import dataclass
 from math import ceil
 
+# Upper limit for the whole plan. Without it a typing slip (MHz instead of Hz) or
+# the half-set fields of an MCP call made millions of Frame objects and ran the
+# computer out of memory.
+MAX_TOTAL_POINTS = 1_000_000
+
 
 @dataclass(frozen=True)
 class Frame:
@@ -83,6 +88,12 @@ def plan_frames(
         raise ValueError(
             f"Alueella on vain {total} pistettä tällä askeleella; laite "
             f"mittaa vähintään {min_points}. Pienennä askelta."
+        )
+    if total > MAX_TOTAL_POINTS:
+        raise ValueError(
+            f"Alueella olisi {total} pistettä tällä askeleella; enintään "
+            f"{MAX_TOTAL_POINTS} sallitaan. Suurenna askelta tai pienennä "
+            "aluetta."
         )
     count = ceil(total / max_points)
     base, extra = divmod(total, count)

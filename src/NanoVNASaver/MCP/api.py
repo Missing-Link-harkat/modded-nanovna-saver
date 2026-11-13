@@ -896,13 +896,13 @@ class SaverAPI:
             )
         win = self.app.windows["custom_sweep"]
         win.name_input.setText(name)
-        for edit, combo, value in (
-            (win.start_input, win.start_unit, start_hz),
-            (win.stop_input, win.stop_unit, stop_hz),
-        ):
-            edit.setText(str(value))
+        # units first: a value typed while the unit is still MHz or GHz is a
+        # plan of billions of points (and the window re-plans on every edit)
+        for combo in (win.start_unit, win.stop_unit, win.resolution_unit):
             combo.setCurrentText("Hz")
-        win.resolution_unit.setCurrentText("Hz")
+        for edit, value in ((win.start_input, start_hz),
+                            (win.stop_input, stop_hz)):
+            edit.setText(str(value))
         win.resolution_input.setMaximum(max(win.resolution_input.maximum(),
                                             step_hz))
         win.resolution_input.setValue(step_hz)

@@ -56,3 +56,21 @@ def test_frame_start_and_stop():
 def test_refusals_say_why(args, message):
     with pytest.raises(ValueError, match=message):
         plan_frames(*args, max_points=401)
+
+
+def test_a_plan_of_too_many_points_is_refused_before_any_frame_is_built():
+    # MHz typed where Hz was meant: 2.35e13 Hz .. 1e14 Hz at 1 kHz = 7.6e10 points.
+    # This used to build ~1.9e8 Frame objects (the CI runner ran out of memory).
+    with pytest.raises(ValueError, match="enintään 1000000"):
+        plan_frames(23_500_000 * 10**6, 100_000_000 * 10**6, 1000, max_points=401)
+    with pytest.raises(ValueError, match="pistettä"):
+        plan_frames(1, 10**12, 1, max_points=401)
+
+
+def test_the_point_limit_itself_is_allowed():
+    from NanoVNASaver.SegmentedSweep import MAX_TOTAL_POINTS
+    plan = plan_frames(1_000_000, 1_000_000 + (MAX_TOTAL_POINTS - 1) * 10, 10,
+                       max_points=401)
+    assert plan.points == MAX_TOTAL_POINTS
+    with pytest.raises(ValueError):
+        plan_frames(1_000_000, 1_000_000 + MAX_TOTAL_POINTS * 10, 10, max_points=401)
