@@ -122,6 +122,18 @@ CABLE_PARAMETERS = (
 MIN_DATA_LENGTH = 2
 
 
+def fft_length(n_data: int, chart_points: int) -> int:
+    """FFT length for n_data spectrum points: the chart's length, or the next
+    power of two that holds all the data when the sweep is longer (#11:
+    a padding of chart_points - n_data went negative and np.pad raised).
+    The time span stays 1 / step; only the sampling of the time axis gets
+    finer."""
+    n = chart_points
+    while n < n_data:
+        n *= 2
+    return n
+
+
 class TDRWindow(QtWidgets.QWidget):
     updated = QtCore.Signal()
 
@@ -263,23 +275,20 @@ class TDRWindow(QtWidgets.QWidget):
         if "lowpass" in TDR_format:
             td = self._tdr_lowpass(TDR_format, s11, TDR_window)
         else:
-            td = np.abs(
-                np.fft.ifft(
-                    self.windowed_s11, self.app.tdr_chart.get_fft_points()
-                )
+            self.fft_points = fft_length(
+                len(self.windowed_s11), self.app.tdr_chart.get_fft_points()
             )
+            td = np.abs(np.fft.ifft(self.windowed_s11, self.fft_points))
             # Convolving with a step function is unnecessary, we can only get
             # the magnitude of impulse response
             if TDR_format == "Refl (bandpass)":
                 self.step_response_Z = (
                     td
-                    * self.app.tdr_chart.get_fft_points()
+                    * self.fft_points
                     / TDR_window["corr"](len(s11), TDR_window["arg"])
                 )
 
-        time_axis = np.linspace(
-            0, 1 / step_size, self.app.tdr_chart.get_fft_points()
-        )
+        time_axis = np.linspace(0, 1 / step_size, self.fft_points)
         self.distance_axis = time_axis * v * speed_of_light
         # peak = np.max(td)
         # We should check that this is an actual *peak*, and not just
@@ -300,16 +309,19 @@ class TDRWindow(QtWidgets.QWidget):
         self.updated.emit()
 
     def _tdr_lowpass(self, tdr_format, s11, tdr_window) -> np.ndarray:
-        pad_points = (
-            self.app.tdr_chart.get_fft_points() - len(self.windowed_s11)
-        ) // 2
+        # windowed_s11 has 2N-1 points (odd) here; fft_points is a larger
+        # power of two, so the padding is never negative (#11)
+        self.fft_points = fft_length(
+            len(self.windowed_s11) + 1, self.app.tdr_chart.get_fft_points()
+        )
+        pad_points = (self.fft_points - len(self.windowed_s11)) // 2
         self.windowed_s11 = np.pad(
             self.windowed_s11, [pad_points + 1, pad_points]
-        )  # Pad array to length self.app.tdr_chart.get_fft_points()
+        )  # Pad array to length self.fft_points
         self.windowed_s11 = np.fft.ifftshift(self.windowed_s11)
 
         td = np.fft.ifft(self.windowed_s11)
-        step = np.ones(self.app.tdr_chart.get_fft_points())
+        step = np.ones(self.fft_points)
         step_response = convolve(td, step)
         step_response_rev = convolve(td[::-1], step)
 
@@ -334,7 +346,7 @@ class TDRWindow(QtWidgets.QWidget):
         if tdr_format == "Refl (lowpass)":
             self.step_response_Z = np.real(
                 td
-                * self.app.tdr_chart.get_fft_points()
+                * self.fft_points
                 / tdr_window["corr"](len(s11), tdr_window["arg"])
             )
         return td
