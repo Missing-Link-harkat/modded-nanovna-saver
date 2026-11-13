@@ -39,7 +39,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from PySide6 import QtCore, QtWidgets
 
-from .. import SweepLogger
 from ..Formatting import format_frequency
 from ..RFTools import Datapoint
 from ..Settings.Sweep import SweepMode
@@ -859,8 +858,8 @@ class SaverAPI:
         """Stop a running sweep (also a segmented sweep)."""
         win = self.app.windows["custom_sweep"]
         if getattr(win, "sweep_active", False):
-            win.sweep_active = False
-            SweepLogger.stop_log()
+            # stops the frame loop too; frames done so far are kept
+            win.request_stop()
         self.app.worker.quit()
         return {"running": self.app.worker.isRunning()}
 
@@ -875,15 +874,26 @@ class SaverAPI:
         self, name: str, start_hz: int, stop_hz: int, step_hz: int
     ) -> Pending:
         """Long high-resolution sweep in frames (the Segmented Sweep
-        window): start_hz..stop_hz with step_hz resolution. VSWR of every
-        point is logged to segmented_sweeps/<time>_<name>/points.csv.
-        Returns the log folder and frame count. Can take long."""
+        window): points start_hz + k*step_hz up to stop_hz (rounded down to
+        the grid), each frame measured with its own point count so the
+        spacing is exactly step_hz. Files in segmented_sweeps/<time>_<name>/:
+        points.csv (frequency, VSWR), settings.csv, sweep.s1p and sweep.s2p
+        (full range). The full range is also the current data, so
+        data_summary, data_points, data_at and the saver://sweep resources
+        see all of it. Returns status (valmis/pysäytetty), point counts,
+        step, calibration note, folder and files. sweep_stop stops it and
+        keeps the frames done. Refused in continuous mode. Can take long."""
         self._require_device()
         self._require_idle()
         if not name.strip():
             raise ActionError("Anna pyyhkäisylle nimi")
         if stop_hz <= start_hz or step_hz <= 0:
             raise ActionError("start < stop ja step > 0")
+        if self.app.sweep.properties.mode == SweepMode.CONTINOUS:
+            raise ActionError(
+                "Jatkuva pyyhkäisy on päällä, eikä kehys silloin pääty. "
+                "Aseta sweep_configure(mode='single') ensin."
+            )
         win = self.app.windows["custom_sweep"]
         win.name_input.setText(name)
         for edit, combo, value in (
@@ -896,30 +906,31 @@ class SaverAPI:
         win.resolution_input.setMaximum(max(win.resolution_input.maximum(),
                                             step_hz))
         win.resolution_input.setValue(step_hz)
-        win.update_frames()
-        if not win.frames_data:
-            raise ActionError("Kehyksiä ei syntynyt; tarkista arvot")
-        frames = len(win.frames_data)
         fut: Future = Future()
 
-        def frame_done() -> None:
-            # CustomSweepWindow's own slot runs first and clears
-            # sweep_active after the last frame.
-            if not win.sweep_active:
-                self.app.sweep_frame_finished.disconnect(frame_done)
-                if not fut.done():
-                    fut.set_result(True)
+        def ended(result: dict) -> None:
+            try:
+                win.segmented_finished.disconnect(ended)
+            except (RuntimeError, TypeError):
+                pass
+            if fut.done():
+                return
+            if result.get("status") == "virhe":
+                fut.set_exception(ActionError(
+                    f"Segmentoitu pyyhkäisy keskeytyi: {result.get('error')} "
+                    f"(kehyksiä {result.get('frames_done')}/"
+                    f"{result.get('frames')}, mitatut pisteet tallessa: "
+                    f"{result.get('log_dir')})"
+                ))
+            else:
+                fut.set_result(result)
 
-        self.app.sweep_frame_finished.connect(frame_done)
-        win.start_sweep()
-        return Pending(
-            fut,
-            lambda _: {
-                "frames": frames,
-                "frames_done": win.current_frame_index,
-                "log_dir": SweepLogger._current_dir,  # noqa: SLF001
-            },
-        )
+        win.segmented_finished.connect(ended)
+        error = win.begin(name)
+        if error:
+            win.segmented_finished.disconnect(ended)
+            raise ActionError(error)
+        return Pending(fut, lambda result: result)
 
     # --- data ------------------------------------------------------------
 
