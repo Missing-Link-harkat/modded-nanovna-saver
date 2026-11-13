@@ -102,6 +102,11 @@ class Refused(ToolError):
 # Marks that the client could not be asked; Saver asks in its own window.
 _ASK_IN_GUI = object()
 
+# Actions that may run while another action is in progress: stopping a running
+# sweep is their whole purpose (a long sweep_segmented or sweep_run holds the
+# action lock until it ends, so sweep_stop used to be refused).
+INTERRUPTS = frozenset({"sweep_stop"})
+
 
 def _client_supports_elicitation(ctx: Context) -> bool:
     try:
@@ -390,7 +395,7 @@ class SaverMCP:
             )
         if self._act_lock is None:
             self._act_lock = asyncio.Lock()
-        lock = self._act_lock if act.risk is not Risk.READ else None
+        lock = self._act_lock if act.risk is not Risk.READ and act.name not in INTERRUPTS else None
         if lock is not None and lock.locked():
             log("denied", "toinen toiminto on käynnissä")
             raise Refused("Toinen toiminto on käynnissä; odota sen valmistumista.")
