@@ -262,12 +262,39 @@ class SaverMCP:
         gets "ok" and believes it was used. The argument model is read on
         every call, so it is replaced here by a strict subclass, and the
         published schema says additionalProperties: false.
+
+        This reaches into the framework's internals (_tool_manager,
+        fn_metadata.arg_model). If a new mcp version moves them, Saver
+        refuses to start the server with a clear message instead of
+        silently accepting guessed parameters again.
         """
-        # pylint: disable-next=protected-access
-        tool = self.server._tool_manager.get_tool(name)
-        meta = tool.fn_metadata
-        base = meta.arg_model
-        allowed = sorted(f.alias or n for n, f in base.model_fields.items())
+        try:
+            # pylint: disable-next=protected-access
+            tool = self.server._tool_manager.get_tool(name)
+        except AttributeError as exc:
+            raise RuntimeError(
+                "MCP: tämä mcp-kirjaston versio ei tarjoa työkalujen "
+                "hallintaa (_tool_manager), joten tuntemattomia parametreja "
+                "ei voi hylätä. Asenna tuettu mcp-versio (pyproject.toml "
+                f"[mcp]). Syy: {exc}"
+            ) from exc
+        if tool is None:
+            raise RuntimeError(
+                f"MCP: työkalua {name} ei löytynyt rekisteröinnin jälkeen"
+            )
+        try:
+            meta = tool.fn_metadata
+            base = meta.arg_model
+            fields = base.model_fields
+            parameters = tool.parameters
+        except AttributeError as exc:
+            raise RuntimeError(
+                "MCP: tämä mcp-kirjaston versio ei tarjoa työkalujen "
+                "argumenttimallia (fn_metadata.arg_model), joten "
+                "tuntemattomia parametreja ei voi hylätä. Asenna tuettu "
+                f"mcp-versio (pyproject.toml [mcp]). Syy: {exc}"
+            ) from exc
+        allowed = sorted(f.alias or n for n, f in fields.items())
         allowed_set = frozenset(allowed)
         allowed_text = ", ".join(allowed) if allowed else "ei parametreja"
 
@@ -290,7 +317,7 @@ class SaverMCP:
         Strict.__name__ = base.__name__
         Strict.__qualname__ = base.__qualname__
         meta.arg_model = Strict
-        tool.parameters["additionalProperties"] = False
+        parameters["additionalProperties"] = False
 
     def _resolver(self, act: Action) -> Any:
         """Resolver asking the client to confirm `act` (mcp >= 2)."""
