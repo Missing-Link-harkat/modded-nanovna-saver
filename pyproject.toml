@@ -27,7 +27,10 @@ dynamic=['version']
 
 dependencies=[
   'pyserial~=3.5',
-  'pyside6~=6.8',
+  # #22: PySide6 6.12.0 drops a reference to None on every QPainter.drawPoint /
+  # drawLine; before Python 3.12 that deallocates None and aborts while charts draw
+  'pyside6~=6.8,!=6.12.0; python_version < "3.12"',
+  'pyside6~=6.8; python_version >= "3.12"',
   'numpy~=2.1',
   'scipy~=1.14',
 ]
