@@ -30,3 +30,23 @@ jobs:
           python -m pip install -e ".[mcp]" pytest httpx
       - name: Test
         run: python -m pytest -q
+
+  device-lock-windows:
+    # The device lock (litevna-openvna#188) uses msvcrt.locking on Windows;
+    # the Linux job cannot run that branch.
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools-scm needs tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mcp]" pytest httpx
+      - name: Device lock tests (two real processes)
+        run: python -m pytest -q tests/test_device_lock_portable.py
