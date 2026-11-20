@@ -213,6 +213,15 @@ sarjanumero `ZN406001` on kaikissa yksilöissä sama.
   näkyvät tilana `gone`.
 - **sweep**: `sweep_get`, `sweep_configure`, `band_list`, `sweep_set_band`,
   `sweep_set_attenuator`, `sweep_run`, `sweep_stop`, `sweep_segmented`
+  - `sweep_segmented(name, start_hz, stop_hz, step_hz)` mittaa pisteet `start_hz + k·step_hz`
+    kehyksinä (enintään 401 pistettä, kehysten koot tasataan). Jokainen kehys mitataan omalla
+    pistemäärällään, joten väli on täsmälleen `step_hz`, eivätkä kehysten reunat toistu
+    (litevna-openvna#204).
+  - Koko alue tallennetaan kansioon `segmented_sweeps/<aika>_<nimi>/`: `points.csv`,
+    `settings.csv` (lopuksi myös tila ja virhe), `sweep.s1p` ja `sweep.s2p`. Lisäksi se jää
+    nykyiseksi dataksi, joten `data_*` ja `saver://sweep/*` näkevät kaiken.
+  - `sweep_stop` ja pääikkunan Stop pysäyttävät koko kehyssilmukan, ja valmiit kehykset säilyvät.
+    Virhe katkaisee silmukan. Jatkuvassa tilassa työkalu kieltäytyy.
 - **data**: `data_summary`, `data_points`, `data_at` (arvo yhdellä taajuudella, interpoloitu mitattujen pisteiden välillä; virhe, jos taajuus on pyyhkäisyn ulkopuolella), `reference_set`, `reference_reset`
 - **markers**: `marker_list`, `marker_set`, `marker_add`, `marker_remove`
 - **analysis**: `analysis_list`, `analysis_run`, `tdr_result`

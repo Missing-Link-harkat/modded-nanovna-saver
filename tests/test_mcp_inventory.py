@@ -58,3 +58,12 @@ def test_every_action_is_described():
 def test_no_firmware_or_flash_actions():
     for name in REGISTRY:
         assert not re.search(r"flash|firmware|dfu|bootloader", name), name
+
+
+def test_only_stop_may_run_while_another_action_runs():
+    # a long sweep holds the action lock; sweep_stop must still get through (device test 13.11., PR #20)
+    from NanoVNASaver.MCP.server import INTERRUPTS
+
+    assert INTERRUPTS == {"sweep_stop"}
+    for name in INTERRUPTS:
+        assert name in REGISTRY

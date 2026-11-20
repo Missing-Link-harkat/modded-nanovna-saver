@@ -103,6 +103,10 @@ INVENTORY: dict[str, str] = {
         "- measured standard files; later issue",
     "Windows/CustomSweepWindow.py: self.sweep_button.clicked.connect(self.start_sweep)":
         "sweep_segmented",
+    "Windows/CustomSweepWindow.py: self.stop_button.clicked.connect(self.request_stop)":
+        "sweep_stop",
+    "Windows/CustomSweepWindow.py: self.parent().sweep_control.btn_stop.clicked.connect(":
+        "sweep_stop",
     "Windows/DeviceSettings.py: self.btnCaptureScreenshot.clicked.connect(self.captureScreenshot)":
         "device_screenshot",
     "Windows/DeviceSettings.py: self.btnLiveView.clicked.connect(self.liveView)":
