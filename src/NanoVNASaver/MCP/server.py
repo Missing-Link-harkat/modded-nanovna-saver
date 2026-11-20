@@ -104,8 +104,9 @@ _ASK_IN_GUI = object()
 
 # Actions that may run while another action is in progress: stopping a running
 # sweep is their whole purpose (a long sweep_segmented or sweep_run holds the
-# action lock until it ends, so sweep_stop used to be refused).
-INTERRUPTS = frozenset({"sweep_stop"})
+# action lock until it ends, so sweep_stop used to be refused). The device's
+# own hires job is followed by device_hires_run in the same way (#212).
+INTERRUPTS = frozenset({"sweep_stop", "device_hires_stop"})
 
 
 def _client_supports_elicitation(ctx: Context) -> bool:

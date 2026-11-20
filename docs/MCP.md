@@ -168,7 +168,26 @@ Ryhmät:
 - **device**: `device_list_ports`, `device_connect`, `device_disconnect`, `device_info`,
   `device_wait`, `device_set_datapoints`, `device_set_bandwidth`, `device_set_validation`,
   `device_screenshot`, `device_shell`, `device_shell_act`, `device_shell_persist`,
-  `device_input` (ks. alla)
+  `device_input` (ks. alla), `device_hires_plan`, `device_hires_run`, `device_hires_status`,
+  `device_hires_stop`
+
+**Laitteen oma tarkka pyyhkäisy (litevna-openvna#212).** Missing Linkin firmware osaa mitata
+laajan alueen itse kehyksinä ja kirjoittaa raa'an S11:n SD-kortille (`hires`, #207).
+- **Ajo:** `device_hires_run(start_hz, stop_hz, step_hz, avg, name)` käynnistää työn ja seuraa
+  sitä. Sen jälkeen se hakee tiedoston `fs get` -komennolla CRC-tarkistettuna ja tallentaa
+  kopion työhakemiston kansioon `hires/`.
+- **Kalibrointi:** jos Saverissa on 1-porttikalibrointi, se tehdään tulokselle (interpoloiden),
+  ja alueen ulkopuoliset pisteet kerrotaan vastauksessa.
+- **Data:** koko alue tulee nykyiseksi dataksi.
+- **Nopeus:** 30 000 pisteen ajoon riittää yksi kutsu. `sweep_segmented` tarvitsisi saman
+  alueen mittaamiseen 75 kehystä, ja jokainen niistä on oma komentonsa.
+- **Ajon aikana:** laite torjuu muut komennot (`?busy`), joten Saver torjuu ne jo itse. Seuranta
+  toimii `device_hires_status`-kutsulla. `device_hires_stop` pääsee läpi, vaikka ajo pitää
+  toimintolukkoa (`INTERRUPTS`), ja jo mitattu osa haetaan ja palautetaan.
+- **Siirto:** tiedosto luetaan 128 tavun paloina suoraan kehotteeseen asti
+  (`Hardware/Hires.py`, `serial_shell`), koska `exec_command` odottaisi 50 ms joka palalla.
+- **Testaus:** virtuaalilaite (`VirtualHires`) vastaa kuten firmware, joten työkalut testataan
+  CI:ssä ilman laitetta (`tests/test_hires_device.py`).
 
 **Laitteen seuranta (litevna-openvna#190).** Kun LiteVNA on kytketty, Saver seuraa sen
 USB-porttipolkua (esim. `1-1`) puolen sekunnin välein (`MCP/device_watch.py`,

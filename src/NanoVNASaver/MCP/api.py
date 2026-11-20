@@ -31,6 +31,7 @@ import bisect
 import cmath
 import logging
 import math
+import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from PySide6 import QtCore, QtWidgets
 
 from ..Formatting import format_frequency
+from ..Hardware import Hires
+from ..Hardware.VNA import VNA
 from ..RFTools import Datapoint
 from ..Settings.Sweep import SweepMode
 from ..Touchstone import Touchstone
@@ -262,6 +265,8 @@ class SaverAPI:
         app.showError = show_error  # type: ignore[method-assign]
         # follows the device across resets and mode changes (#190)
         self.watch = DeviceWatch(app)
+        # the device's own hires job while Saver follows it (#212)
+        self._hires_job: dict | None = None
 
     # --- helpers ---------------------------------------------------------
 
@@ -283,6 +288,12 @@ class SaverAPI:
         if self.app.worker.isRunning():
             raise ActionError(
                 "Pyyhkäisy on käynnissä. Odota tai käytä sweep_stop."
+            )
+        if getattr(self, "_hires_job", None) is not None:
+            raise ActionError(
+                "Laitteen oma tarkka pyyhkäisy (hires) on käynnissä, ja laite "
+                "torjuu muut komennot sen ajan. Seuraa device_hires_status, "
+                "tai pysäytä device_hires_stop."
             )
 
     def _require_device(self) -> None:
@@ -931,6 +942,201 @@ class SaverAPI:
             win.segmented_finished.disconnect(ended)
             raise ActionError(error)
         return Pending(fut, lambda result: result)
+
+    # --- the device's own high-resolution sweep (litevna-openvna #212) ----
+
+    def _hires_shell(self) -> Hires.Shell:
+        vna = self.app.vna
+        if (type(vna).exec_command is VNA.exec_command
+                and hasattr(vna.serial, "read_until")):
+            return Hires.serial_shell(vna.serial)
+        return lambda cmd, timeout: list(vna.exec_command(cmd))
+
+    def _require_hires(self) -> Hires.Shell:
+        self._require_device()
+        if not self._our_firmware():
+            raise ActionError(
+                "Laitteen oma tarkka pyyhkäisy toimii vain Missing Linkin "
+                "laiteohjelmistolla (proto 1.x). Käytä sweep_segmented."
+            )
+        return self._hires_shell()
+
+    @action(
+        "device_hires_plan",
+        risk=Risk.READ,
+        category="device",
+        gui=("MCP only: no Saver control (the device's own hires job)",),
+        timeout=30.0,
+    )
+    def device_hires_plan(
+        self, start_hz: int, stop_hz: int, step_hz: int, avg: int = 1
+    ) -> dict:
+        """Ask the device how it would measure start_hz..stop_hz at step_hz
+        by itself (frames of up to 401 points, grid start + k*step): points,
+        frames, last point, estimated seconds and warnings (e.g. a step finer
+        than the synthesizer). Nothing is measured. Range 23.5 MHz to the
+        device's upper limit, at most 200000 points, avg 1..16."""
+        shell = self._require_hires()
+        try:
+            plan = Hires.parse_plan(
+                shell(Hires.plan_command(start_hz, stop_hz, step_hz, avg), 10.0))
+        except Hires.HiresError as exc:
+            raise ActionError(f"Laite torjui suunnitelman: {exc}") from exc
+        return plan.as_dict()
+
+    @action(
+        "device_hires_run",
+        risk=Risk.ACT,
+        category="device",
+        gui=("MCP only: no Saver control (the device's own hires job)",),
+        timeout=4 * 3600,
+    )
+    def device_hires_run(
+        self,
+        start_hz: int,
+        stop_hz: int,
+        step_hz: int,
+        avg: int = 1,
+        name: str = "HIRES",
+    ) -> Pending:
+        """Let the DEVICE measure start_hz..stop_hz at step_hz by itself
+        (up to 200000 points; much faster than sweep_segmented, no
+        per-frame commands). It writes raw S11 to its SD card
+        (MEAS/<antenna>/<name>_NNN.s1p); Saver follows the job, fetches the
+        file (CRC checked), keeps a copy in the workspace (hires/), applies
+        Saver's 1-port calibration if one is active and makes the whole
+        range the current data (data_summary, data_points, data_at,
+        saver://sweep/*). While it runs the device refuses other commands;
+        follow it with device_hires_status, stop it with device_hires_stop
+        (the measured part is kept). Needs the Missing Link firmware, the SD
+        card on the device (USB mode control) and no running sweep. name:
+        1-20 characters A-Z a-z 0-9 _ -. Returns status, points, files,
+        calibration and the data summary."""
+        shell = self._require_hires()
+        self._require_idle()
+        try:
+            cmd = Hires.start_command(start_hz, stop_hz, step_hz, avg, name)
+            plan, path = Hires.parse_started(shell(cmd, 15.0))
+        except Hires.HiresError as exc:
+            raise ActionError(f"Laite ei aloittanut: {exc}") from exc
+        job: dict = {"path": path, "plan": plan, "status": None,
+                     "fetched": 0, "size": 0}
+        self._hires_job = job
+        fut: Future = Future()
+        poll_s = 0.2 if self.app.vna.name == "VirtualVNA" else 1.0
+
+        def follow() -> None:
+            try:
+                deadline = time.monotonic() + max(600, plan.estimate_s * 3 + 120)
+                while True:
+                    st = Hires.parse_status(shell("hires status", 5.0))
+                    job["status"] = st
+                    if st.finished:
+                        break
+                    if time.monotonic() > deadline:
+                        shell("hires stop", 5.0)
+                        raise Hires.HiresError(
+                            "työ kesti yli kolminkertaisen arvion, joten se "
+                            "pysäytettiin")
+                    time.sleep(poll_s)
+                data = b""
+                if st.points_done > 0:
+                    data = Hires.fetch_file(
+                        shell, st.file or path,
+                        progress=lambda d, s: job.update(fetched=d, size=s))
+                fut.set_result((st, data))
+            except (Hires.HiresError, OSError, ValueError) as exc:
+                fut.set_exception(ActionError(
+                    f"Laitteen hires-työ: {exc} (tiedosto laitteella: {path})"))
+            finally:
+                self._hires_job = None
+
+        threading.Thread(target=follow, name="hires-follow", daemon=True).start()
+        return Pending(fut, lambda r: self._hires_result(r[0], r[1], name))
+
+    def _hires_result(self, st: Hires.Status, data: bytes, name: str) -> dict:
+        result = {"status": st.state, "message": st.message,
+                  "points": st.points, "points_measured": 0,
+                  "device_file": st.file, "local_file": None,
+                  "calibrated": False, "calibration": "", "elapsed_s": st.elapsed_s}
+        if not data:
+            return result
+        local = self._path(f"hires/{Path(st.file).name}", (".s1p",))
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(data)
+        result["local_file"] = str(local)
+        ts = Touchstone()
+        ts.loads(data.decode("ascii", "replace"))
+        s11 = ts.s11
+        result["points_measured"] = len(s11)
+        if not s11:
+            return result
+        cal = self.app.calibration
+        if cal.isCalculated and cal.isValid1Port():
+            s11 = [cal.correct11(dp) for dp in s11]
+            result["calibrated"] = True
+            lo, hi = cal.dataset.freq_min(), cal.dataset.freq_max()
+            outside = sum(1 for d in s11 if not lo <= d.freq <= hi)
+            result["calibration"] = (
+                f"Saverin 1-porttikalibrointi {lo}..{hi} Hz (interpoloitu)"
+                + (f"; {outside} pistettä alueen ulkopuolella, korjattu "
+                   "reunan termeillä" if outside else ""))
+        else:
+            result["calibration"] = "ei kalibrointia (laitteen raaka S11)"
+        s21 = [Datapoint(d.freq, 0.0, 0.0) for d in s11]
+        self.app.saveData(s11, s21,
+                          source=f"{name} (laitteen hires, {len(s11)} pistettä)")
+        try:
+            self.app.dataUpdated()
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Updating views after the hires job")
+        result["summary"] = self.data_summary()
+        return result
+
+    @action(
+        "device_hires_status",
+        risk=Risk.READ,
+        category="device",
+        gui=("MCP only: no Saver control (the device's own hires job)",),
+        timeout=15.0,
+    )
+    def device_hires_status(self) -> dict:
+        """State of the device's own hires job: idle / running / done /
+        aborted / failed, frame and point progress, elapsed and estimated
+        seconds left, the file on the SD card and, while Saver is fetching
+        the result, how many bytes it has (fetched/size). Works while the
+        job runs."""
+        job = self._hires_job
+        if job is not None and job.get("status") is not None \
+                and job["status"].finished:
+            out = job["status"].as_dict()
+        else:
+            shell = self._require_hires()
+            try:
+                out = Hires.parse_status(shell("hires status", 5.0)).as_dict()
+            except Hires.HiresError as exc:
+                raise ActionError(str(exc)) from exc
+        out["saver_following"] = job is not None
+        if job is not None:
+            out["fetched_bytes"] = job["fetched"]
+            out["file_bytes"] = job["size"]
+        return out
+
+    @action(
+        "device_hires_stop",
+        risk=Risk.ACT,
+        category="device",
+        gui=("MCP only: no Saver control (the device's own hires job)",),
+        timeout=15.0,
+    )
+    def device_hires_stop(self) -> dict:
+        """Stop the device's own hires job at its next point. The part
+        already measured stays in the file, and a running device_hires_run
+        then fetches and returns it."""
+        shell = self._require_hires()
+        lines = shell("hires stop", 5.0)
+        return {"output": "\n".join(lines),
+                "stopped": any("stopping" in ln for ln in lines)}
 
     # --- data ------------------------------------------------------------
 
