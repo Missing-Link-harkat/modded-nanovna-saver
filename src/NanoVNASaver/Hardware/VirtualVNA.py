@@ -296,7 +296,11 @@ class VirtualVNA(VNA):
         self.features.add("Screenshots")
 
     def screen_image(self) -> QImage:
-        """The simulated screen for the current range, without noise."""
+        """The simulated screen for the current range, without noise.
+
+        With --virtual-bench this draws the raw, uncalibrated measurement
+        of whatever the bench file says is connected, as a real device's
+        own screen would (Saver's calibration is not applied on it)."""
         freqs = self._freqs()
         s11, _ = self._values(freqs)
         return render_screen(self._start, self._stop, np.asarray(s11))
