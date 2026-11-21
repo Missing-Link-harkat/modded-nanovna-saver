@@ -64,6 +64,7 @@ def test_only_stop_may_run_while_another_action_runs():
     # a long sweep holds the action lock; sweep_stop must still get through (device test 13.11., PR #20)
     from NanoVNASaver.MCP.server import INTERRUPTS
 
-    assert INTERRUPTS == {"sweep_stop"}
+    # device_hires_stop: a device_hires_run holds the lock while the device measures (#212)
+    assert INTERRUPTS == {"sweep_stop", "device_hires_stop"}
     for name in INTERRUPTS:
         assert name in REGISTRY

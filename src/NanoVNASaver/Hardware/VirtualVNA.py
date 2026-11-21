@@ -30,12 +30,14 @@ It also has a simulated 480x320 device screen (getScreenshot), so the
 device_screenshot tool and UI tests can be developed without hardware.
 """
 
+import base64
 import logging
 import math
+import zlib
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 import numpy as np
 from PySide6.QtCore import QPointF
@@ -246,6 +248,174 @@ def render_screen(
     return img
 
 
+class VirtualHires:
+    """The firmware's `hires` job and `fs get` (litevna-openvna #207), as
+    the shell shows them: the job advances with wall time (point_s per
+    point and average) and writes raw S11 of the simulated device to a
+    Touchstone file kept in memory."""
+
+    F_LOW = 23_500_000
+    F_HIGH = 6_000_000_000
+    TOTAL_MAX = 200_000
+    FRAME = 401
+    CHUNK = 128
+    BUSY = "?busy: a hires job is running (hires status, hires stop)"
+    ALLOWED = {"hires", "help", "version", "info", "sweep-stats", "usb",
+               "reset", "capture"}
+
+    def __init__(self, vna: "VirtualVNA") -> None:
+        self.vna = vna
+        self.point_s = 0.0002
+        self.files: dict[str, bytes] = {}
+        self.run = 0
+        self.job: dict | None = None
+
+    # --- helpers ---------------------------------------------------------
+
+    def _plan(self, words: list[str]) -> tuple[dict | None, list[str]]:
+        try:
+            a, b, st = (int(w) for w in words[2:5])
+            avg = int(words[5]) if len(words) > 5 else 1
+        except ValueError:
+            return None, ["?usage: hires plan <start> <stop> <step> [avg]"]
+        if not 1 <= avg <= 16:
+            return None, ["?hires: avg must be 1..16"]
+        if st == 0:
+            return None, ["?hires: step must be above 0"]
+        if b < a:
+            return None, ["?hires: stop is below start"]
+        if a < self.F_LOW:
+            return None, ["?hires: start is below 23.5 MHz (the synthesizer "
+                          "cannot go lower)"]
+        if b > self.F_HIGH:
+            return None, ["?hires: stop is above 6.0 GHz (the synthesizer "
+                          "cannot go higher)"]
+        total = (b - a) // st + 1
+        if total > self.TOTAL_MAX:
+            return None, ["?hires: too many points (limit 200000)"]
+        frames = math.ceil(total / self.FRAME)
+        per = math.ceil(total / frames)
+        frames = math.ceil(total / per)
+        plan = {"start": a, "step": st, "total": total, "frames": frames,
+                "per": per, "avg": avg}
+        est = int(total * avg * self.point_s)
+        lines = [f"hires: {total} points, {frames} frames of up to {per}, "
+                 f"last point {a + (total - 1) * st} Hz, estimated {est} s "
+                 f"(avg {avg})"]
+        # synthesizer step at the top: 12 kHz above 3 GHz, halved per octave
+        res, f = 12000, a + (total - 1) * st
+        while f < 3_000_000_000 and res > 1:
+            f, res = f * 2, res // 2
+        if st < res:
+            lines.append("hires: warning: step is finer than the synthesizer "
+                         "step at the top of the range (12 kHz above 3 GHz, "
+                         "half per octave below)")
+        return plan, lines
+
+    def _progress(self) -> int:
+        job = self.job
+        if job["state"] != "running":
+            return job["done"]
+        done = int((monotonic() - job["t0"]) / (self.point_s * job["plan"]["avg"]))
+        if done >= job["plan"]["total"]:
+            self._finish("done", job["plan"]["total"])
+            return job["done"]
+        return done
+
+    def _finish(self, state: str, done: int) -> None:
+        job = self.job
+        job["state"], job["done"] = state, done
+        job["t1"] = monotonic()
+        plan = job["plan"]
+        freqs = np.array([plan["start"] + k * plan["step"] for k in range(done)],
+                         dtype=float)
+        s11 = self.vna._values(freqs)[0] if done else []  # pylint: disable=protected-access
+        rows = [f"{int(f)} {v.real:.6e} {v.imag:.6e}" for f, v in zip(freqs, s11)]
+        note = (f"! finished: virtual, {done} points" if state == "done" else
+                f"! aborted at frame {done // plan['per'] + 1} (stopped), "
+                f"{done} points written")
+        text = "\r\n".join([
+            "! Touchstone export from VirtualVNA, hires sweep (#207)",
+            f"! hires: {plan['start']} Hz .. step {plan['step']} Hz, "
+            f"{plan['total']} points",
+            "! calibration: none (raw S11)",
+            "# Hz S RI R 50", *rows, note, ""])
+        self.files[job["path"]] = text.encode("ascii")
+
+    def _status(self) -> list[str]:
+        if self.job is None:
+            return ["hires: idle"]
+        done = self._progress()
+        job, plan = self.job, self.job["plan"]
+        end = job.get("t1", monotonic())
+        frame = min(plan["frames"], done // plan["per"] + 1)
+        eta = int(max(0, plan["total"] - done) * plan["avg"] * self.point_s)
+        lines = [f"hires: {job['state']}, frame {frame}/{plan['frames']}, "
+                 f"point {done}/{plan['total']}, elapsed {int(end - job['t0'])} s, "
+                 f"eta {eta if job['state'] == 'running' else 0} s, "
+                 f"avg {plan['avg']}",
+                 f"hires: file {job['path']}"]
+        if job["state"] == "aborted":
+            lines.append("hires: stopped")
+        return lines
+
+    def _fs_get(self, words: list[str]) -> list[str]:
+        data = self.files.get(words[2])
+        if data is None:
+            return [f"?fs get: {words[2]}: no such file"]
+        if len(words) == 3:
+            return [f"size {len(data)} crc {zlib.crc32(data) & 0xFFFFFFFF:08x} "
+                    f"chunk {self.CHUNK}"]
+        off = int(words[3])
+        if off >= len(data):
+            return ["eof"]
+        chunk = data[off:off + self.CHUNK]
+        return [f"data {off} {len(chunk)} {zlib.crc32(chunk) & 0xFFFFFFFF:08x} "
+                f"{base64.b64encode(chunk).decode()}"]
+
+    # --- shell -------------------------------------------------------------
+
+    def running(self) -> bool:
+        if self.job is None or self.job["state"] != "running":
+            return False
+        self._progress()  # may finish the job
+        return self.job["state"] == "running"
+
+    def handle(self, words: list[str]) -> list[str] | None:
+        """Reply lines for a hires/fs get command or a busy refusal; None
+        when the command is not ours and no job blocks it."""
+        if not words:
+            return None
+        if words[0] == "fs" and len(words) >= 3 and words[1] == "get":
+            return [self.BUSY] if self.running() else self._fs_get(words)
+        if words[0] != "hires":
+            if self.running() and words[0] not in self.ALLOWED:
+                return [self.BUSY]
+            return None
+        sub = words[1] if len(words) > 1 else ""
+        if sub == "status":
+            return self._status()
+        if sub == "stop":
+            if not self.running():
+                return ["hires: no job running"]
+            self._finish("aborted", self._progress())
+            return ["hires: stopping (the file keeps what was measured)"]
+        if sub in ("plan", "start") and len(words) >= 5:
+            plan, lines = self._plan(words)
+            if plan is None or sub == "plan":
+                return lines
+            if self.running():
+                return [*lines, "?hires: a hires job is already running"]
+            name = words[6] if len(words) > 6 else "HIRES"
+            self.run += 1
+            path = f"MEAS/NONAME/{name}_{self.run:03d}.s1p"
+            self.job = {"plan": plan, "path": path, "state": "running",
+                        "done": 0, "t0": monotonic()}
+            return [*lines, f"hires: started, file {path}"]
+        return ["?usage: hires plan <start> <stop> <step> [avg] | hires start "
+                "<start> <stop> <step> [avg] [name] | hires status | hires stop"]
+
+
 class VirtualVNA(VNA):
     name = "VirtualVNA"
     valid_datapoints = (101, 201, 401, 51, 11)
@@ -263,6 +433,7 @@ class VirtualVNA(VNA):
         self.shell_log: list[str] = []
         self.noise = 0.0005
         self.segment_delay = 0.05
+        self.hires = VirtualHires(self)
         if SOURCE:
             self._file = Touchstone(SOURCE)
             self._file.load()
@@ -277,6 +448,10 @@ class VirtualVNA(VNA):
         answers like the Missing Link firmware for a few commands."""
         self.shell_log.append(command)
         words = command.split()
+        reply = self.hires.handle(words)
+        if reply is not None:
+            yield from reply
+            return
         if command == "version":
             yield "Version 1.0.0"
             yield "proto 1.0"
