@@ -998,6 +998,7 @@ class SaverAPI:
         step_hz: int,
         avg: int = 1,
         name: str = "HIRES",
+        out: str = "sd",
     ) -> Pending:
         """Let the DEVICE measure start_hz..stop_hz at step_hz by itself
         (up to 200000 points; much faster than sweep_segmented, no
@@ -1010,10 +1011,17 @@ class SaverAPI:
         follow it with device_hires_status, stop it with device_hires_stop
         (the measured part is kept). Needs the Missing Link firmware, the SD
         card on the device (USB mode control) and no running sweep. name:
-        1-20 characters A-Z a-z 0-9 _ -. Returns status, points, files,
-        calibration and the data summary."""
+        1-20 characters A-Z a-z 0-9 _ -. out: "sd" (default: the file, then
+        fetched), "usb" (the device streams every frame as it finishes, no
+        file and no card needed) or "both" (stream and file); streaming
+        needs a firmware whose `info` lists "stream v1" (#210). Returns
+        status, points, files, calibration and the data summary."""
         shell = self._require_hires()
         self._require_idle()
+        if out not in Hires.OUTS:
+            raise ActionError("out: sd, usb tai both")
+        if out != "sd":
+            return self._hires_run_streamed(start_hz, stop_hz, step_hz, avg, name, out)
         try:
             cmd = Hires.start_command(start_hz, stop_hz, step_hz, avg, name)
             plan, path = Hires.parse_started(shell(cmd, 15.0))
@@ -1054,6 +1062,55 @@ class SaverAPI:
         threading.Thread(target=follow, name="hires-follow", daemon=True).start()
         return Pending(fut, lambda r: self._hires_result(r[0], r[1], name))
 
+    def _hires_link(self) -> Hires.Link:
+        vna = self.app.vna
+        if vna.name == "VirtualVNA" and hasattr(vna, "hires"):
+            return vna.hires.link()
+        return Hires.serial_link(vna.serial)
+
+    def _hires_run_streamed(self, start_hz, stop_hz, step_hz, avg, name, out) -> Pending:
+        """device_hires_run with out=usb|both (#210): the frames come over USB
+        as the device finishes them; nothing is fetched afterwards."""
+        shell = self._require_hires()
+        if not Hires.supports_stream(shell("info", 5.0)):
+            raise ActionError(
+                "Laiteohjelmisto ei tue hires-suoratoistoa (info ei kerro "
+                "'stream v1', litevna-openvna#210). Käytä out='sd'.")
+        try:
+            cmd = Hires.start_command(start_hz, stop_hz, step_hz, avg, name, out)
+            plan = Hires.parse_plan(shell(Hires.plan_command(start_hz, stop_hz,
+                                                             step_hz, avg), 10.0))
+        except Hires.HiresError as exc:
+            raise ActionError(f"Laite ei aloittanut: {exc}") from exc
+        link = self._hires_link()
+        job: dict = {"path": "", "plan": plan, "status": None, "fetched": 0,
+                     "size": 0, "link": link, "frames": 0, "stream": True}
+        self._hires_job = job
+        fut: Future = Future()
+
+        def follow() -> None:
+            try:
+                st = Hires.follow_stream(
+                    link, cmd, timeout=max(600, plan.estimate_s * 3 + 120),
+                    progress=lambda s: job.update(frames=len(s.frames)))
+                b, e = st.begin or {}, st.end or {}
+                status = Hires.Status(
+                    e.get("state", "failed"), len(st.frames), b.get("frames", 0),
+                    len(st.points()), b.get("total", 0), 0, 0, b.get("avg", avg),
+                    b.get("file", ""), e.get("message", ""))
+                job["status"] = status
+                if st.bad:
+                    status.message = (status.message + "; " if status.message else "") + \
+                        f"{st.bad} vioittunutta pakettia hylättiin"
+                fut.set_result((status, st.touchstone() if st.frames else b""))
+            except (Hires.HiresError, OSError, ValueError) as exc:
+                fut.set_exception(ActionError(f"Laitteen hires-suoratoisto: {exc}"))
+            finally:
+                self._hires_job = None
+
+        threading.Thread(target=follow, name="hires-stream", daemon=True).start()
+        return Pending(fut, lambda r: self._hires_result(r[0], r[1], name))
+
     def _hires_result(self, st: Hires.Status, data: bytes, name: str) -> dict:
         result = {"status": st.state, "message": st.message,
                   "points": st.points, "points_measured": 0,
@@ -1061,7 +1118,8 @@ class SaverAPI:
                   "calibrated": False, "calibration": "", "elapsed_s": st.elapsed_s}
         if not data:
             return result
-        local = self._path(f"hires/{Path(st.file).name}", (".s1p",))
+        fname = Path(st.file).name if st.file else f"{name}_stream.s1p"
+        local = self._path(f"hires/{fname}", (".s1p",))
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(data)
         result["local_file"] = str(local)
@@ -1110,6 +1168,12 @@ class SaverAPI:
         if job is not None and job.get("status") is not None \
                 and job["status"].finished:
             out = job["status"].as_dict()
+        elif job is not None and job.get("stream"):
+            # streaming (#210): asking the shell would throw away stream bytes
+            plan = job["plan"]
+            out = {"state": "running", "frame": job["frames"], "frames": plan.frames,
+                   "points": plan.points, "stream_frames": job["frames"],
+                   "avg": plan.avg, "file": "", "message": "suoratoisto käynnissä"}
         else:
             shell = self._require_hires()
             try:
@@ -1133,6 +1197,12 @@ class SaverAPI:
         """Stop the device's own hires job at its next point. The part
         already measured stays in the file, and a running device_hires_run
         then fetches and returns it."""
+        job = self._hires_job
+        if job is not None and job.get("stream"):
+            # streaming (#210): send without reading; the END packet confirms it
+            job["link"].send("hires stop")
+            return {"output": "hires stop sent (the stream ends with the END packet)",
+                    "stopped": True}
         shell = self._require_hires()
         lines = shell("hires stop", 5.0)
         return {"output": "\n".join(lines),

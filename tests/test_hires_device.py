@@ -94,6 +94,47 @@ def test_fetch_file_checks_every_chunk_and_the_whole():
         Hires.fetch_file(lambda c, t: ["?fs get: X: no such file"], "X")
 
 
+# --- the stream (litevna-openvna #210) --------------------------------------
+
+
+def _stream_bytes():
+    vals0 = [complex(0.5, -0.25), complex(0.125, 0.0)]
+    vals1 = [complex(1e-3, 2e-3), complex(-0.5, 0.75)]
+    return (b"hires: started, file X\r\nch> "
+            + Hires.encode_begin(1000, 10, 4, 2, 2, avg=1, out=3, name="X.s1p")
+            + Hires.encode_frame(0, 0, vals0) + b"hires: running\r\nch> "
+            + Hires.encode_frame(1, 2, vals1) + Hires.encode_end(2, 4, 2) + b"\r\nch> ")
+
+
+def test_stream_packets_are_found_between_shell_text():
+    st = Hires.Stream().feed(_stream_bytes())
+    assert st.bad == 0 and st.end["state"] == "done"
+    assert [p[0] for p in st.points()] == [1000, 1010, 1020, 1030]
+    assert st.rows().splitlines()[0] == "1000 5.000000e-01 -2.500000e-01"
+    assert "hires: running" in st.text_lines()
+    # in small pieces, as a serial port gives them
+    data = _stream_bytes()
+    st = Hires.Stream()
+    for i in range(0, len(data), 5):
+        st.feed(data[i:i + 5])
+    assert len(st.points()) == 4 and st.end is not None
+    # one flipped bit: that frame is dropped, never half-used
+    bad = bytearray(data)
+    bad[data.index(b"\xa5\x21") + 20] ^= 1
+    st = Hires.Stream().feed(bytes(bad))
+    assert st.bad == 1 and sorted(st.frames) == [1]
+
+
+def test_stream_command_and_feature():
+    assert Hires.start_command(1, 2, 3, 1, "A", "usb").endswith(" A out=usb")
+    assert "out=" not in Hires.start_command(1, 2, 3, 1, "A")
+    with pytest.raises(Hires.HiresError, match="out="):
+        Hires.start_command(1, 2, 3, 1, "A", "disk")
+    assert Hires.supports_stream(["Board: x", "Features: hires (out=sd|usb|both, stream v1)"])
+    assert not Hires.supports_stream(["Board: x"])
+    assert Hires.parse_started_any([PLAN, "hires: started, file (none), stream on"])[1] == ""
+
+
 # --- end to end on the virtual device through MCP ------------------------
 
 mcp = pytest.importorskip("mcp")
@@ -219,3 +260,51 @@ def test_stop_through_mcp_while_the_run_holds_the_lock(saver):
     assert 0 < res["points_measured"] < 766
     with window.dataLock:
         assert len(window.data.s11) == res["points_measured"]
+
+
+def _rows(text: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln and ln[0].isdigit()]
+
+
+@e2e
+def test_stream_both_is_the_file_bit_for_bit(saver):
+    """out=both (#210): the frames over USB rebuild the SD file's rows exactly."""
+    _, window, _, _ = saver
+    ok(call(saver, "device_connect", {"port": "virtual"}))
+    res = ok(call(saver, "device_hires_run", {**GRID, "name": "both", "out": "both"}))
+    assert res["status"] == "done" and res["points_measured"] == 766
+    assert res["device_file"].startswith("MEAS/NONAME/both_")
+    streamed = open(res["local_file"], encoding="ascii").read()
+    on_card = window.vna.hires.files[res["device_file"]].decode("ascii")
+    assert _rows(streamed) == _rows(on_card)
+    with window.dataLock:
+        assert len(window.data.s11) == 766
+
+
+@e2e
+def test_stream_usb_only_and_stop(saver):
+    qapp, window, svc, _ = saver
+    ok(call(saver, "device_connect", {"port": "virtual"}))
+    res = ok(call(saver, "device_hires_run", {**GRID, "name": "usb", "out": "usb"}))
+    assert res["status"] == "done" and res["device_file"] == ""
+    assert res["local_file"].endswith("usb_stream.s1p") and res["points_measured"] == 766
+    assert "usb" not in str(list(window.vna.hires.files))       # no file on the card
+
+    window.vna.hires.point_s = 0.002
+
+    async def go():
+        async with Client(svc.server) as a, Client(svc.server) as b:
+            task = asyncio.create_task(a.call_tool(
+                "device_hires_run", {**GRID, "name": "us", "out": "usb"}))
+            await asyncio.sleep(0.9)
+            status = await b.call_tool("device_hires_status", {})
+            stop = await b.call_tool("device_hires_stop", {})
+            return status, stop, await task
+
+    status, stop, res = run(qapp, go)
+    window.vna.hires.point_s = 0.0002
+    assert ok(status)["saver_following"] is True
+    assert ok(stop)["stopped"] is True
+    res = ok(res)
+    assert res["status"] == "aborted"
+    assert res["points_measured"] in (0, 383)    # only whole frames are streamed
