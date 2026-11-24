@@ -272,6 +272,63 @@ class VirtualHires:
 
     # --- helpers ---------------------------------------------------------
 
+    def _s11(self, freqs: np.ndarray) -> np.ndarray:
+        """Raw S11 as the firmware keeps it: float32 re/im (the file's rows
+        and the stream's values are then the same numbers, #210)."""
+        return self.vna._values(freqs)[0].astype(np.complex64)  # pylint: disable=protected-access
+
+    def link(self):
+        """A byte-level link as the serial port gives it: shell text, the
+        prompt and, with out=usb|both, the stream packets (#210)."""
+        from . import Hires  # pylint: disable=import-outside-toplevel
+        buf = bytearray()
+
+        def send(cmd: str) -> None:
+            lines = self.handle(cmd.split())
+            if lines is None:
+                lines = list(self.vna.exec_command(cmd))
+            job = self.job
+            if job is not None and job.pop("begin_due", False):
+                plan = job["plan"]
+                buf.extend(Hires.encode_begin(
+                    plan["start"], plan["step"], plan["total"], plan["frames"],
+                    plan["per"], plan["avg"], 0, {"usb": 2, "both": 3}[job["out"]],
+                    self.run, job["path"]))
+            buf.extend(("\r\n".join(lines) + "\r\nch> ").encode("ascii"))
+
+        def read(timeout: float) -> bytes:
+            self._stream(buf, Hires)
+            if not buf:
+                sleep(min(timeout, 0.02))
+                self._stream(buf, Hires)
+            data = bytes(buf)
+            buf.clear()
+            return data
+
+        return Hires.Link(lambda c, t: list(self.vna.exec_command(c)), send, read)
+
+    def _stream(self, buf: bytearray, hires) -> None:
+        """Frames finished since the last call, and END when the job is over."""
+        job = self.job
+        if job is None or job.get("out", "sd") == "sd" or job.get("ended"):
+            return
+        done = self._progress()
+        plan = job["plan"]
+        complete = plan["frames"] if job["state"] == "done" else done // plan["per"]
+        while job["sent"] < complete:
+            fr = job["sent"]
+            first = fr * plan["per"]
+            n = min(plan["per"], plan["total"] - first)
+            freqs = np.array([plan["start"] + (first + k) * plan["step"]
+                              for k in range(n)], dtype=float)
+            buf.extend(hires.encode_frame(fr, first, self._s11(freqs)))
+            job["sent"] += 1
+        if job["state"] != "running":
+            buf.extend(hires.encode_end({"done": 2, "aborted": 3}.get(job["state"], 4),
+                                        job["done"], job["sent"],
+                                        "" if job["state"] == "done" else "stop requested"))
+            job["ended"] = True
+
     def _plan(self, words: list[str]) -> tuple[dict | None, list[str]]:
         try:
             a, b, st = (int(w) for w in words[2:5])
@@ -327,9 +384,11 @@ class VirtualHires:
         job["state"], job["done"] = state, done
         job["t1"] = monotonic()
         plan = job["plan"]
+        if "sd" not in job.get("out", "sd") and job.get("out") != "both":
+            return                                    # out=usb: no file (#210)
         freqs = np.array([plan["start"] + k * plan["step"] for k in range(done)],
                          dtype=float)
-        s11 = self.vna._values(freqs)[0] if done else []  # pylint: disable=protected-access
+        s11 = self._s11(freqs) if done else []
         rows = [f"{int(f)} {v.real:.6e} {v.imag:.6e}" for f, v in zip(freqs, s11)]
         note = (f"! finished: virtual, {done} points" if state == "done" else
                 f"! aborted at frame {done // plan['per'] + 1} (stopped), "
@@ -393,6 +452,12 @@ class VirtualHires:
                 return [self.BUSY]
             return None
         sub = words[1] if len(words) > 1 else ""
+        out = "sd"                                    # #210: out=sd|usb|both anywhere
+        for w in [w for w in words if w.startswith("out=")]:
+            out = w[4:]
+            words = [x for x in words if x != w]
+            if out not in ("sd", "usb", "both"):
+                return ["?hires: out=sd|usb|both"]
         if sub == "status":
             return self._status()
         if sub == "stop":
@@ -408,10 +473,12 @@ class VirtualHires:
                 return [*lines, "?hires: a hires job is already running"]
             name = words[6] if len(words) > 6 else "HIRES"
             self.run += 1
-            path = f"MEAS/NONAME/{name}_{self.run:03d}.s1p"
+            path = "" if out == "usb" else f"MEAS/NONAME/{name}_{self.run:03d}.s1p"
             self.job = {"plan": plan, "path": path, "state": "running",
-                        "done": 0, "t0": monotonic()}
-            return [*lines, f"hires: started, file {path}"]
+                        "done": 0, "t0": monotonic(), "out": out, "sent": 0,
+                        "begin_due": out != "sd"}
+            tail = "" if out == "sd" else ", stream on (0xA5 packets 0x20-0x22)"
+            return [*lines, f"hires: started, file {path or '(none)'}{tail}"]
         return ["?usage: hires plan <start> <stop> <step> [avg] | hires start "
                 "<start> <stop> <step> [avg] [name] | hires status | hires stop"]
 
@@ -457,6 +524,7 @@ class VirtualVNA(VNA):
             yield "proto 1.0"
         elif command == "info":
             yield "Board: VIRTUAL (NanoVNA-H 4 compatible, virtual)"
+            yield "Features: hires (out=sd|usb|both, stream v1), hires-cal (interp|reim)"
         elif command == "sweep-stats":
             yield "sweeps: 0 late: 0"
         elif command == "sweep" and len(words) == 1:
